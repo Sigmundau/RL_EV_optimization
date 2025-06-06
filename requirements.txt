@@ -8,3 +8,6 @@ tensorflow-probability==0.23.0
 tf_keras==2.15.0
 tensorboard===2.15.2
 numba===0.61.2
+yfinance === 0.2.58
+statsmodels === 0.14.4
+fredapi === 0.4.0
