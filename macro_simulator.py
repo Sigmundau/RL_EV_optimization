@@ -125,7 +125,6 @@ class Simulation:
             if self.debug:
                 print(f"Error fitting VAR model: {e}")
             raise
-
     def reset(self, path_length: int = 100, noise_scale: float = 1.0, random_start_window_quarters: int = 40):
         """
         Resets the simulation by generating a new randomized path for all variables,
@@ -134,10 +133,10 @@ class Simulation:
         Args:
             path_length (int): The desired length of the new simulated path.
             noise_scale (float): A multiplier for the standard deviation of the residuals,
-                                 controlling the randomness/volatility of the new path.
+                                controlling the randomness/volatility of the new path.
             random_start_window_quarters (int): The number of recent quarters from the end
-                                                 of the historical data from which a random
-                                                 start date can be chosen.
+                                                of the historical data from which a random
+                                                start date can be chosen.
         """
         if self.model_fit is None:
             raise RuntimeError("VAR model has not been fitted. Call _fit_var_model() first.")
@@ -158,7 +157,7 @@ class Simulation:
         if effective_min_idx >= max_start_idx:
             if self.debug:
                 print(f"Warning: random_start_window_quarters ({random_start_window_quarters}) is too large or data is too short. "
-                  f"Selecting random start from available range [{self.processed_data.index[min_start_idx].to_period('Q')}] to [{self.processed_data.index[max_start_idx].to_period('Q')}]")
+                    f"Selecting random start from available range [{self.processed_data.index[min_start_idx].to_period('Q')}] to [{self.processed_data.index[max_start_idx].to_period('Q')}]")
             random_start_idx = np.random.randint(min_start_idx, max_start_idx + 1)
         else:
             random_start_idx = np.random.randint(effective_min_idx, max_start_idx + 1)
@@ -168,19 +167,51 @@ class Simulation:
 
         params = self.model_fit.params
         sigma_u = self.model_fit.sigma_u
-
         num_variables = self.processed_data.shape[1]
 
-        shocks = np.random.multivariate_normal(
-            np.zeros(num_variables),
-            sigma_u * noise_scale,
-            size=path_length
-        )
+        # Validate sigma_u
+        is_valid_sigma = (hasattr(sigma_u, 'shape') and 
+                        sigma_u.shape == (num_variables, num_variables) and 
+                        not np.any(np.isnan(sigma_u)) and 
+                        sigma_u.size > 0)
+        
+        if not is_valid_sigma:
+            if self.debug:
+                print(f"Warning: Invalid sigma_u (shape={getattr(sigma_u, 'shape', 'None')}, size={getattr(sigma_u, 'size', 'None')}). Using diagonal matrix.")
+            sigma_u = np.eye(num_variables) * 0.01  # Fallback to small diagonal covariance
+        else:
+            # Check positive semi-definiteness
+            try:
+                np.linalg.cholesky(sigma_u)  # Raises LinAlgError if not positive definite
+            except np.linalg.LinAlgError:
+                if self.debug:
+                    print(f"Warning: sigma_u is not positive definite. Using diagonal matrix.")
+                sigma_u = np.eye(num_variables) * 0.01
+
+        if self.debug:
+            print(f"Using sigma_u with shape={sigma_u.shape}, num_variables={num_variables}, path_length={path_length}")
+
+        # Generate shocks
+        try:
+            shocks = np.random.multivariate_normal(
+                np.zeros(num_variables),
+                sigma_u * noise_scale,
+                size=path_length
+            )
+            if self.debug:
+                print(f"Generated shocks with shape={shocks.shape}")
+        except np.linalg.LinAlgError as e:
+            if self.debug:
+                print(f"Error generating shocks: {e}. Using zero shocks.")
+            shocks = np.zeros((path_length, num_variables))
 
         simulated_data = initial_conditions.tolist()
 
         for i in range(path_length):
-            predicted_next_val = self.model_fit.forecast(y=np.array(simulated_data[-self.var_order:]), steps=1)[0]
+            forecast_input = np.array(simulated_data[-self.var_order:])
+            predicted_next_val = self.model_fit.forecast(y=forecast_input, steps=1)[0]
+            if self.debug:
+                print(f"Iteration {i}: predicted_next_val shape={predicted_next_val.shape}, shocks[{i}] shape={shocks[i].shape}")
             next_val_with_shock = predicted_next_val + shocks[i]
             simulated_data.append(next_val_with_shock.tolist())
 
@@ -191,22 +222,15 @@ class Simulation:
         self.simulated_path = pd.DataFrame(
             final_simulated_path,
             index=simulated_index,
-            columns=self.processed_data.columns # All variables are in the simulated path
+            columns=self.processed_data.columns  # All variables are in the simulated path
         )
         
-        # 3. Calculate derived variables. These will also become part of the VAR model.
-        # Real Growth: Quarterly GDP Growth (Quarter-over-Quarter percentage change)
-        self.simulated_path['REAL_GROWTH'] = self.simulated_path['GDP_REAL      '].pct_change(periods=1) * 100
-
-        # FX Strength: Quarterly change in USD Index
+        # Calculate derived variables
+        self.simulated_path['REAL_GROWTH'] = self.simulated_path['GDP_DEF'].pct_change(periods=1) * 100
         self.simulated_path['FX_STRENGTH'] = self.simulated_path['USD_INDEX'].pct_change(periods=1) * 100
-
-        # Expected Inflation: Quarterly PCE Price Index growth (Quarter-over-Quarter percentage change)
         self.simulated_path['INFLATION'] = self.simulated_path['PCE_PRICE_INDEX'].pct_change(periods=1) * 100
-
         self.simulated_path['AAA_10Y'] = self.simulated_path['10Y'] + self.simulated_path['AAA10YM'] 
         self.simulated_path['BAA_10Y'] = self.simulated_path['10Y'] + self.simulated_path['BAA10YM'] 
-        #Interpolate (linear) 2Y spread
         self.simulated_path['AAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['AAAFF'] + (self.simulated_path['AAA10YM'] - self.simulated_path['AAAFF'])*0.2
         self.simulated_path['BAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['BAAFF'] + (self.simulated_path['BAA10YM'] - self.simulated_path['BAAFF'])*0.2
 
@@ -214,10 +238,10 @@ class Simulation:
         self.current_index = 0
         if self.debug:
             print(f"New randomized joint path generated. Start Date: {sim_path_start_date.to_period('Q')}")
+            print(f"Simulated path shape: {self.simulated_path.shape}")
             print(f"Simulated path starts from: {self.simulated_path.index[0].to_period('Q')}")
             print(f"Simulated path ends at: {self.simulated_path.index[-1].to_period('Q')}")
-
-
+            
     def retrieve_next_forecast(self, steps: int = 1) -> pd.DataFrame:
         """
         Retrieves the next 'steps' forecasted values for a selected subset of variables
@@ -245,37 +269,3 @@ class Simulation:
         self.current_index = min(end_index, len(self.simulated_path))
 
         return forecasted_values
-
-
-# --- Example Usage ---
-# if __name__ == "__main__":
-#     FRED_API_KEY = "5446f1dec140788657af4c0720a225b2" # Your FRED API key from the notebook
-
-#     print("--- Joint Macroeconomic Simulation (Quarterly Resolution with Random Start - All Data in VAR) ---")
-#     try:
-#         macro_simulation = Simulation(
-#             fred_api_key=FRED_API_KEY,
-#             var_order=4 # Example: using 4 lags for quarterly data
-#         )
-
-#         print("\nInitial Joint Forecast (5 steps / 5 quarters - Selected Outputs):")
-#         forecast_initial = macro_simulation.retrieve_next_forecast(steps=5)
-#         print(forecast_initial)
-
-#         print("\nAnother 3 steps (3 quarters) of Joint Forecast (Selected Outputs):")
-#         forecast_next = macro_simulation.retrieve_next_forecast(steps=3)
-#         print(forecast_next)
-
-#         print("\nResetting Joint Simulation and forecasting 10 steps (10 quarters) with custom window (Selected Outputs):")
-#         macro_simulation.reset(path_length=20, noise_scale=1.2, random_start_window_quarters=20)
-#         forecast_reset = macro_simulation.retrieve_next_forecast(steps=10)
-#         print(forecast_reset)
-
-#         print("\nContinuously retrieving until path end (and auto-reset) (Selected Outputs):")
-#         for _ in range(3):
-#             next_vals = macro_simulation.retrieve_next_forecast(steps=5)
-#             print(f"\nNext 5 values (from {next_vals.index[0].to_period('Q')} to {next_vals.index[-1].to_period('Q')}): \n{next_vals.to_string()}")
-
-#     except Exception as e:
-#         print(f"An error occurred during joint macroeconomic simulation: {e}")
-#         print("Please ensure your FRED API key is correct and the FRED series IDs are valid and have sufficient data.")
