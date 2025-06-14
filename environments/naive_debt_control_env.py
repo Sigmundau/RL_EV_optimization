@@ -1,12 +1,3 @@
-"""
-Debt-Control Phase-0 MVP environment
------------------------------------
-• Quarterly time-step
-• State  : [L, E]  (leverage %, EBIT)
-• Actions: {-5 pp, 0, +5 pp} leverage move
-• Reward : ΔEV – λ·default_penalty – φ·recap_cost
-"""
-
 from __future__ import annotations
 import numpy as np
 import gymnasium as gym
