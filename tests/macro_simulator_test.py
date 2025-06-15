@@ -10,7 +10,7 @@ import os
 # Assuming macro_simulator.py is in the same directory as the test file
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
-from macro_simulator import Simulation
+from utils.macro_simulator import Simulation
 
 class TestSimulation(unittest.TestCase):
 
