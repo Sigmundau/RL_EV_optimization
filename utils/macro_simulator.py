@@ -16,7 +16,7 @@ class Simulation:
             fred_api_key (str): Your FRED API key.
             var_order (int): The order (number of lags) for the VAR model.
         """
-        self.fred = Fred(api_key=fred_api_key)
+        self.fred = Fred(fred_api_key)
         self.var_order = var_order
         self.model_fit = None
         self.simulated_path = None
@@ -86,7 +86,7 @@ class Simulation:
 
         # 2. Resample all series to a consistent quarterly frequency ('QS' - Quarter Start)
         # Taking the last observation of the quarter for all series
-        merged_df_quarterly = merged_df.resample('QS').last()
+        merged_df_quarterly = merged_df.resample('QE').last()
         
         # NOTE: No additional ffill/bfill here on merged_df_quarterly.
         # This is because we filled NaNs on the higher frequency merged_df first.
@@ -125,7 +125,7 @@ class Simulation:
             if self.debug:
                 print(f"Error fitting VAR model: {e}")
             raise
-    def reset(self, path_length: int = 100, noise_scale: float = 1.0, random_start_window_quarters: int = 40):
+    def reset(self, path_length: int = 100, noise_scale: float = 1.0, random_start_window_quarters: int = 40,origin: pd.Timestamp=None):
         """
         Resets the simulation by generating a new randomized path for all variables,
         starting from a randomly selected quarter within the historical data.
@@ -145,23 +145,36 @@ class Simulation:
 
         if self.debug:
             print(f"Resetting joint simulation with a new randomized path of length {path_length} (Quarterly Resolution)...")
-
-        min_start_idx = self.var_order + 1
-        max_start_idx = len(self.processed_data) - 1
-
-        start_window_limit_idx = len(self.processed_data) - random_start_window_quarters - 1
-        max_start_idx = min(max_start_idx, len(self.processed_data) - 1)
         
-        effective_min_idx = max(min_start_idx, start_window_limit_idx)
-
-        if effective_min_idx >= max_start_idx:
-            if self.debug:
-                print(f"Warning: random_start_window_quarters ({random_start_window_quarters}) is too large or data is too short. "
-                    f"Selecting random start from available range [{self.processed_data.index[min_start_idx].to_period('Q')}] to [{self.processed_data.index[max_start_idx].to_period('Q')}]")
-            random_start_idx = np.random.randint(min_start_idx, max_start_idx + 1)
+        if origin is not None: # Changed to 'is not None' for clarity
+            # Find the integer position of the origin timestamp
+            try:
+                # Use get_loc for a single exact match
+                random_start_idx = self.processed_data.index.get_loc(origin)
+            except KeyError:
+                raise ValueError(f"Origin timestamp {origin} not found in processed data index.")
+            
+            # Ensure there are enough preceding observations for the VAR order
+            if random_start_idx < self.var_order:
+                raise ValueError(f"Origin timestamp {origin} is too early. Need at least {self.var_order} observations before it for VAR model.")
         else:
-            random_start_idx = np.random.randint(effective_min_idx, max_start_idx + 1)
-
+            min_start_idx = self.var_order + 1
+            max_start_idx = len(self.processed_data) - 1
+    
+            start_window_limit_idx = len(self.processed_data) - random_start_window_quarters - 1
+            max_start_idx = min(max_start_idx, len(self.processed_data) - 1)
+            
+            effective_min_idx = max(min_start_idx, start_window_limit_idx)
+    
+            if effective_min_idx >= max_start_idx:
+                if self.debug:
+                    print(f"Warning: random_start_window_quarters ({random_start_window_quarters}) is too large or data is too short. "
+                        f"Selecting random start from available range [{self.processed_data.index[min_start_idx].to_period('Q')}] to [{self.processed_data.index[max_start_idx].to_period('Q')}]")
+                random_start_idx = np.random.randint(min_start_idx, max_start_idx + 1)
+            else:
+                random_start_idx = np.random.randint(effective_min_idx, max_start_idx + 1)
+        
+        # Now random_start_idx is an integer index
         initial_conditions = self.processed_data.iloc[random_start_idx - self.var_order : random_start_idx].values
         sim_path_start_date = self.processed_data.index[random_start_idx]
 
@@ -217,7 +230,7 @@ class Simulation:
 
         final_simulated_path = np.array(simulated_data[self.var_order:])
 
-        simulated_index = pd.to_datetime(pd.date_range(start=sim_path_start_date, periods=path_length, freq='QS'))
+        simulated_index = pd.to_datetime(pd.date_range(start=sim_path_start_date, periods=path_length, freq='QE'))
 
         self.simulated_path = pd.DataFrame(
             final_simulated_path,
