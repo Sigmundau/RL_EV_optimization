@@ -76,7 +76,6 @@ class Simulation:
         for df in all_fred_dataframes[1:]:
             merged_df = pd.merge(merged_df, df, left_index=True, right_index=True, how='outer')
 
-
         # Data Pre-processing for VAR
         # 1. Ensure all data is numeric and handle NaNs at the original frequency first
         merged_df = merged_df.apply(pd.to_numeric, errors='coerce')
@@ -87,10 +86,12 @@ class Simulation:
         # 2. Resample all series to a consistent quarterly frequency ('QS' - Quarter Start)
         # Taking the last observation of the quarter for all series
         merged_df_quarterly = merged_df.resample('QE').last()
-        
-        # NOTE: No additional ffill/bfill here on merged_df_quarterly.
-        # This is because we filled NaNs on the higher frequency merged_df first.
 
+        # 3. Identify variables that should be log-transformed to ensure no negative rate/spread
+        log_transform_vars = ['EFFR', '10Y', '2Y','AAAFF','AAA10YM','BAAFF','BAA10YM']
+        for col in log_transform_vars:
+            if col in merged_df_quarterly.columns:
+                merged_df_quarterly[col] = np.log(merged_df_quarterly[col])
         # All processed series (original and derived) are retained for the VAR model
         # Drop any remaining NaNs after all transformations.
         self.processed_data = merged_df_quarterly.dropna()
@@ -237,7 +238,11 @@ class Simulation:
             index=simulated_index,
             columns=self.processed_data.columns  # All variables are in the simulated path
         )
-        
+        # Inverse Log transformation for non-negative values
+        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAAFF', 'AAA10YM', 'BAAFF', 'BAA10YM']
+        for col in log_transform_vars:
+            if col in self.simulated_path.columns:
+                self.simulated_path[col] = np.exp(self.simulated_path[col])
         # Calculate derived variables
         self.simulated_path['REAL_GROWTH'] = self.simulated_path['GDP_DEF'].pct_change(periods=1) * 100
         self.simulated_path['FX_STRENGTH'] = self.simulated_path['USD_INDEX'].pct_change(periods=1) * 100
@@ -248,13 +253,24 @@ class Simulation:
         self.simulated_path['BAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['BAAFF'] + (self.simulated_path['BAA10YM'] - self.simulated_path['BAAFF'])*0.2
 
         self.simulated_path.dropna(inplace=True)
-        self.current_index = 0
+        self.current_index = 1 # Start from the second row since the first is the initial condition
         if self.debug:
             print(f"New randomized joint path generated. Start Date: {sim_path_start_date.to_period('Q')}")
             print(f"Simulated path shape: {self.simulated_path.shape}")
             print(f"Simulated path starts from: {self.simulated_path.index[0].to_period('Q')}")
             print(f"Simulated path ends at: {self.simulated_path.index[-1].to_period('Q')}")
-            
+    
+    def retrieve_origin_data(self) -> pd.DataFrame:
+        """
+        Retrieves the origin of the forecasting values.
+
+        Returns:
+            pd.DataFrame: A pandas DataFrame containing the origin of forecasts.
+        """
+        if self.simulated_path is None:
+            raise RuntimeError("Processed data not available. Call _fetch_and_prepare_data() first.")
+        return self.simulated_path.iloc[0].to_frame().T        
+    
     def retrieve_next_forecast(self, steps: int = 1) -> pd.DataFrame:
         """
         Retrieves the next 'steps' forecasted values for a selected subset of variables
