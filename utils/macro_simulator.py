@@ -5,6 +5,7 @@ import yfinance as yf
 from functools import reduce
 from statsmodels.tsa.api import VAR
 # from statsmodels.tsa.statespace.varmax import VARMAX # Not yet used, but for VARMA consideration
+from arch import arch_model
 from statsmodels.tools.eval_measures import \
     rmse  # For potential evaluation, not directly used in simulation but good to have
 
@@ -89,13 +90,22 @@ class Simulation:
         # Taking the last observation of the quarter for all series
         merged_df_quarterly = merged_df.resample('QE').last()
 
-        # 3. Identify variables that should be log-transformed to ensure no negative rate/spread
-        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAAFF', 'AAA10YM', 'BAAFF', 'BAA10YM']
+        # 3. Suppress yield into actual value, also convert into spread format
+        # BBB = AAA + BBB_AAA_spread ; AAA = EFFR+ AAA_spread
+
+        merged_df_quarterly['AAA_SPREAD_FF'] = merged_df_quarterly['AAAFF'] - merged_df_quarterly['EFFR']
+        merged_df_quarterly['AAA_SPREAD_10Y'] = merged_df_quarterly['AAA10YM'] - merged_df_quarterly['EFFR']
+        merged_df_quarterly['BAA_AAA_SPREAD_FF'] = merged_df_quarterly['BAAFF'] - merged_df_quarterly['AAAFF']
+        merged_df_quarterly['BAA_AAA_SPREAD_10Y'] = merged_df_quarterly['BAA10YM'] - merged_df_quarterly['AAA10YM']
+
+        # 4. Identify variables that should be log-transformed to ensure no negative rate/spread
+        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF',
+                              'BAA_AAA_SPREAD_10Y']
         for col in log_transform_vars:
             if col in merged_df_quarterly.columns:
                 merged_df_quarterly[col] = np.log(merged_df_quarterly[col])
 
-        # 4. add market return
+        # 5. add market return
         spx = yf.Ticker('^GSPC')
         spx_data = spx.history(period='max')['Close'].resample('QE').last()
         spx_data.index = spx_data.index.tz_localize(None)
@@ -107,7 +117,13 @@ class Simulation:
 
         # All processed series (original and derived) are retained for the VAR model
         # Drop any remaining NaNs after all transformations.
-        self.processed_data = merged_df_quarterly.dropna()
+        # Exclude the original absolute AAA/BAA yields, include the spreads instead
+        var_columns = [
+            'EMPLOYMENT', 'EFFR', 'FPI', 'GDP', 'GDP_DEF', '10Y', 'M2', 'PCE',
+            'UNEMPLOYMENT', 'PCE_PRICE_INDEX', '2Y', 'USD_INDEX', 'MARKET_RETURN',
+            'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF', 'BAA_AAA_SPREAD_10Y'
+        ]
+        self.processed_data = merged_df_quarterly[var_columns].dropna()
 
         if self.processed_data.empty:
             raise ValueError(
@@ -121,21 +137,54 @@ class Simulation:
 
     def _fit_var_model(self):
         """
-        Fits a VAR model to the prepared macroeconomic data.
+        Fits a VAR model to the prepared macroeconomic data and then fits
+        univariate GARCH models to the VAR residuals.
         """
         if self.processed_data is None or self.processed_data.empty:
             raise RuntimeError("Processed data not available or empty. Call _fetch_and_prepare_data first.")
 
         if self.debug:
             print(f"Fitting VAR({self.var_order}) model with {self.processed_data.shape[1]} endogenous variables...")
-            print(
-                "WARNING: A VAR model with many variables and limited data can lead to overfitting and unstable results.")
+
         try:
             model = VAR(self.processed_data)
             self.model_fit = model.fit(self.var_order)
             if self.debug:
                 print("VAR model fitted successfully.")
-                # print(self.model_fit.summary()) # Uncomment to see summary (might be very long)
+            # print(self.model_fit.summary()) # Uncomment to see summary
+
+            # --- NEW: Extract VAR Residuals and Fit Univariate GARCH Models ---
+            self.var_residuals = self.model_fit.resid  # Get residuals from the VAR model
+            self.garch_models = {}  # To store fitted GARCH models for each residual series
+            self.initial_garch_forecast_variance = {}  # To store the last conditional variance for simulation start
+
+            if self.debug:
+                print(f"Fitting univariate GARCH(1,1) models to VAR residuals...")
+
+            for col_name in self.var_residuals.columns:
+                try:
+                    # Fit GARCH(1,1) for simplicity. You can experiment with p and q.
+                    am = arch_model(self.var_residuals[col_name], vol='Garch', p=1, q=1, dist='normal')
+                    res = am.fit(update_freq=0, disp='off')  # disp='off' to suppress solver output
+                    self.garch_models[col_name] = res
+
+                    # Store the last conditional variance to start the simulation
+                    # This will be the starting point for forecasting volatility in reset()
+                    if not res.conditional_variance.empty:
+                        self.initial_garch_forecast_variance[col_name] = res.conditional_variance.iloc[-1]
+                    else:
+                        # Fallback if no conditional variance is estimated (e.g., constant variance)
+                        self.initial_garch_forecast_variance[col_name] = res.resid.var()
+
+                    if self.debug:
+                        print(f"  - Fitted GARCH for {col_name}. Log-likelihood: {res.loglikelihood:.4f}")
+                except Exception as garch_e:
+                    if self.debug:
+                        print(f"  - Warning: Could not fit GARCH for {col_name}: {garch_e}. Using constant variance.")
+                    # Fallback to constant variance if GARCH fails
+                    self.garch_models[col_name] = None
+                    self.initial_garch_forecast_variance[col_name] = self.var_residuals[col_name].var()
+
         except Exception as e:
             if self.debug:
                 print(f"Error fitting VAR model: {e}")
@@ -155,8 +204,8 @@ class Simulation:
                                                 of the historical data from which a random
                                                 start date can be chosen.
         """
-        if self.model_fit is None:
-            raise RuntimeError("VAR model has not been fitted. Call _fit_var_model() first.")
+        if self.model_fit is None or not self.garch_models:
+            raise RuntimeError("VAR or GARCH models have not been fitted. Call _fit_var_model() first.")
         if self.processed_data is None or self.processed_data.empty:
             raise RuntimeError("Processed data not available. Cannot reset simulation.")
 
@@ -199,56 +248,67 @@ class Simulation:
         sim_path_start_date = self.processed_data.index[random_start_idx]
 
         params = self.model_fit.params
-        sigma_u = self.model_fit.sigma_u
         num_variables = self.processed_data.shape[1]
 
-        # Validate sigma_u
-        is_valid_sigma = (hasattr(sigma_u, 'shape') and
-                          sigma_u.shape == (num_variables, num_variables) and
-                          not np.any(np.isnan(sigma_u)) and
-                          sigma_u.size > 0)
-
-        if not is_valid_sigma:
-            if self.debug:
-                print(
-                    f"Warning: Invalid sigma_u (shape={getattr(sigma_u, 'shape', 'None')}, size={getattr(sigma_u, 'size', 'None')}). Using diagonal matrix.")
-            sigma_u = np.eye(num_variables) * 0.01  # Fallback to small diagonal covariance
-        else:
-            # Check positive semi-definiteness
-            try:
-                np.linalg.cholesky(sigma_u)  # Raises LinAlgError if not positive definite
-            except np.linalg.LinAlgError:
-                if self.debug:
-                    print(f"Warning: sigma_u is not positive definite. Using diagonal matrix.")
-                sigma_u = np.eye(num_variables) * 0.01
+        simulated_data = initial_conditions.tolist()
+        current_garch_variances = np.array([
+            self.initial_garch_forecast_variance.get(col_name, self.var_residuals[col_name].var())
+            for col_name in self.processed_data.columns
+        ])
 
         if self.debug:
-            print(f"Using sigma_u with shape={sigma_u.shape}, num_variables={num_variables}, path_length={path_length}")
-
-        # Generate shocks
-        try:
-            shocks = np.random.multivariate_normal(
-                np.zeros(num_variables),
-                sigma_u * noise_scale,
-                size=path_length
-            )
-            if self.debug:
-                print(f"Generated shocks with shape={shocks.shape}")
-        except np.linalg.LinAlgError as e:
-            if self.debug:
-                print(f"Error generating shocks: {e}. Using zero shocks.")
-            shocks = np.zeros((path_length, num_variables))
-
-        simulated_data = initial_conditions.tolist()
+            print(f"Initial GARCH variances for simulation: {current_garch_variances}")
 
         for i in range(path_length):
             forecast_input = np.array(simulated_data[-self.var_order:])
             predicted_next_val = self.model_fit.forecast(y=forecast_input, steps=1)[0]
-            if self.debug:
-                print(
-                    f"Iteration {i}: predicted_next_val shape={predicted_next_val.shape}, shocks[{i}] shape={shocks[i].shape}")
-            next_val_with_shock = predicted_next_val + shocks[i]
+
+            # --- NEW: Generate GARCH-informed shocks ---
+            # Generate independent standard normal shocks
+            standard_normal_shocks = np.random.normal(0, 1, size=num_variables)
+
+            # Apply conditional standard deviations to the shocks
+            # We assume a diagonal covariance matrix here (i.e., no dynamic correlation)
+            # This implements the "simple GARCH" part.
+            conditional_stds = np.sqrt(current_garch_variances)
+            garch_shocks = standard_normal_shocks * conditional_stds * noise_scale
+
+            # Add the shocks to the forecasted mean
+            next_val_with_shock = predicted_next_val + garch_shocks.flatten()  # .flatten() to ensure correct shape
+
             simulated_data.append(next_val_with_shock.tolist())
+
+            # --- NEW: Update GARCH conditional variances for the *next* step based on the *current* simulated shock ---
+            # This is crucial for volatility clustering.
+            # You need the actual residual from the current simulated step to update the GARCH recursion.
+            # Since we don't have the "true" residual (only the simulated shock), we use the shock as proxy.
+            # This is a simplification; a full GARCH simulation would recursively apply the GARCH equation.
+            # A more robust approach might involve a custom GARCH simulation function that takes previous shocks.
+            for j, col_name in enumerate(self.processed_data.columns):
+                garch_model_res = self.garch_models.get(col_name)
+                if garch_model_res:
+                    # Access GARCH parameters for update: omega, alpha, beta
+                    # This requires knowing the parameter order from arch_model.summary()
+                    # For GARCH(1,1) with dist='normal', params are often: mu, omega, alpha[1], beta[1]
+                    # This is a simplified manual GARCH(1,1) update.
+                    # A more reliable way is to use arch's forecast method if it supports recursive updates easily.
+
+                    # Example GARCH(1,1) equation for variance: var_t = omega + alpha * resid_{t-1}^2 + beta * var_{t-1}
+                    omega = garch_model_res.params['omega']
+                    alpha1 = garch_model_res.params['alpha[1]']
+                    beta1 = garch_model_res.params['beta[1]']
+
+                    # Use the squared *simulated shock* as the "previous residual squared"
+                    # This is a key approximation in simulation.
+                    squared_simulated_shock = garch_shocks[j] ** 2
+
+                    # Update the conditional variance for the next step
+                    next_conditional_variance = omega + alpha1 * squared_simulated_shock + beta1 * \
+                                                current_garch_variances[j]
+                    current_garch_variances[j] = next_conditional_variance
+                else:
+                    # If no GARCH model was fitted, variance remains constant (historical variance)
+                    pass
 
         final_simulated_path = np.array(simulated_data[self.var_order:])
 
@@ -260,20 +320,26 @@ class Simulation:
             columns=self.processed_data.columns  # All variables are in the simulated path
         )
         # Inverse Log transformation for non-negative values
-        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAAFF', 'AAA10YM', 'BAAFF', 'BAA10YM']
+        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF',
+                              'BAA_AAA_SPREAD_10Y']
         for col in log_transform_vars:
             if col in self.simulated_path.columns:
                 self.simulated_path[col] = np.exp(self.simulated_path[col])
+
+        # Reconstitute absolute yield values from simulated spreads
+        self.simulated_path['AAA_FF'] = self.simulated_path['EFFR'] + self.simulated_path['AAA_SPREAD_FF']
+        self.simulated_path['AAA_10Y'] = self.simulated_path['EFFR'] + self.simulated_path['AAA_SPREAD_10Y']
+        self.simulated_path['BAA_FF'] = self.simulated_path['AAA_FF'] + self.simulated_path['BAA_AAA_SPREAD_FF']
+        self.simulated_path['BAA_10Y'] = self.simulated_path['AAA_10Y'] + self.simulated_path['BAA_AAA_SPREAD_10Y']
+
         # Calculate derived variables
         self.simulated_path['REAL_GROWTH'] = self.simulated_path['GDP_DEF'].pct_change(periods=1) * 100
         self.simulated_path['FX_STRENGTH'] = self.simulated_path['USD_INDEX'].pct_change(periods=1) * 100
         self.simulated_path['INFLATION'] = self.simulated_path['PCE_PRICE_INDEX'].pct_change(periods=1) * 100
-        self.simulated_path['AAA_10Y'] = self.simulated_path['10Y'] + self.simulated_path['AAA10YM']
-        self.simulated_path['BAA_10Y'] = self.simulated_path['10Y'] + self.simulated_path['BAA10YM']
-        self.simulated_path['AAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['AAAFF'] + (
-                    self.simulated_path['AAA10YM'] - self.simulated_path['AAAFF']) * 0.2
-        self.simulated_path['BAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['BAAFF'] + (
-                    self.simulated_path['BAA10YM'] - self.simulated_path['BAAFF']) * 0.2
+        self.simulated_path['AAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['AAA_FF'] + (
+                self.simulated_path['AAA_10Y'] - self.simulated_path['AAA_FF']) * 0.2
+        self.simulated_path['BAA_2Y'] = self.simulated_path['2Y'] + self.simulated_path['BAA_FF'] + (
+                self.simulated_path['BAA_10Y'] - self.simulated_path['BAA_FF']) * 0.2
 
         self.simulated_path.dropna(inplace=True)
         self.current_index = 1  # Start from the second row since the first is the initial condition
