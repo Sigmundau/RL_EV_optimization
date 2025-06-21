@@ -127,7 +127,7 @@ class NaiveDebtControlEnv(gym.Env):
         self.t += 1
         terminated = (self.E < 0.0) or (self.t >= self.p.ep_len)
 
-        return self._get_obs(), reward, terminated, False, {"ev": EV_t, "ebit": self.E}
+        return self._get_obs(), reward, terminated, False, {"ev": np.float32(EV_t), "ebit": np.float32(self.E)}
 
     # -------------- helpers --------------
     def _internal_reset(self):
