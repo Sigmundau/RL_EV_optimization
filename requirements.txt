@@ -5,3 +5,5 @@ tensorboard===2.15.2
 yfinance === 0.2.58
 statsmodels === 0.14.4
 fredapi === 0.4.0
+torch === 2.7.1
+torchrl === 0.8.1
