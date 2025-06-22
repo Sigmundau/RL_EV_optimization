@@ -8,16 +8,19 @@ from statsmodels.tsa.api import VAR
 from arch import arch_model
 from statsmodels.tools.eval_measures import \
     rmse  # For potential evaluation, not directly used in simulation but good to have
+import datetime
 
 
 class Simulation:
-    def __init__(self, fred_api_key: str, var_order: int = 1, debug: bool = False):
+    def __init__(self, fred_api_key: str, var_order: int = 1, debug: bool = False, csv_path: str = "data/FRED_data.csv"):
         """
         Initializes the Simulation class for joint macroeconomic forecasting.
 
         Args:
             fred_api_key (str): Your FRED API key.
             var_order (int): The order (number of lags) for the VAR model.
+            debug (bool): If True, enables debug output for tracing computation values.
+            csv_path (str): Path to a CSV file containing historical data for the macroeconomic variables.
         """
         self.fred = Fred(fred_api_key)
         self.var_order = var_order
@@ -25,6 +28,7 @@ class Simulation:
         self.simulated_path = None
         self.current_index = 0
         self.processed_data = None  # Store the data prepared for VAR model
+        self.csv_path = csv_path  # Path to CSV file for historical data, if provided
 
         # Define the columns that should be returned by retrieve_next_forecast
         self.default_output_columns = [
@@ -46,94 +50,97 @@ class Simulation:
         if self.debug:
             print("Fetching data from FRED and Yahoo Finance for joint simulation (Quarterly Resolution)...")
 
-        # FRED Data - Combined list of all desired series
-        fred_data_sources = {
-            'AAAFF': 'AAAFF',
-            'AAA10YM': 'AAA10YM',
-            'BAAFF': 'BAAFF',
-            'BAA10YM': 'BAA10YM',
-            'EMPLOYMENT': 'CE16OV',
-            'EFFR': 'FEDFUNDS',
-            'FPI': 'FPI',
-            'GDP': 'GDP',
-            'GDP_DEF': 'GDPDEF',
-            '10Y': 'GS10',  # Long Term Yield
-            'M2': 'M2SL',
-            'PCE': 'PCEC',
-            'UNEMPLOYMENT': 'UNRATE',
-            'PCE_PRICE_INDEX': 'PCEPI',  # For inflation calculation
-            '2Y': 'GS2',  # Short Term Yield
-            'USD_INDEX': 'TWEXB'  # Broad Trade Weighted US Dollar Index
-        }
+        if self.csv_path != "":
+            self.processed_data = pd.read_csv(self.csv_path, index_col=0)
+            self.processed_data.index = pd.to_datetime(self.processed_data.index).date()
+        else:
+            # FRED Data - Combined list of all desired series
+            fred_data_sources = {
+                'AAAFF': 'AAAFF',
+                'AAA10YM': 'AAA10YM',
+                'BAAFF': 'BAAFF',
+                'BAA10YM': 'BAA10YM',
+                'EMPLOYMENT': 'CE16OV',
+                'EFFR': 'FEDFUNDS',
+                'FPI': 'FPI',
+                'GDP': 'GDP',
+                'GDP_DEF': 'GDPDEF',
+                '10Y': 'GS10',  # Long Term Yield
+                'M2': 'M2SL',
+                'PCE': 'PCEC',
+                'UNEMPLOYMENT': 'UNRATE',
+                'PCE_PRICE_INDEX': 'PCEPI',  # For inflation calculation
+                '2Y': 'GS2',  # Short Term Yield
+                'USD_INDEX': 'TWEXB'  # Broad Trade Weighted US Dollar Index
+            }
 
-        all_fred_dataframes = []
-        for col_name, series_id in fred_data_sources.items():
-            df = pd.DataFrame(self.fred.get_series(series_id), columns=[col_name])
-            all_fred_dataframes.append(df)
+            all_fred_dataframes = []
+            for col_name, series_id in fred_data_sources.items():
+                df = pd.DataFrame(self.fred.get_series(series_id), columns=[col_name])
+                all_fred_dataframes.append(df)
 
-        # Merge FRED data using an OUTER merge for broader date range
-        if not all_fred_dataframes:
-            raise RuntimeError("No FRED dataframes to merge.")
+            # Merge FRED data using an OUTER merge for broader date range
+            if not all_fred_dataframes:
+                raise RuntimeError("No FRED dataframes to merge.")
 
-        merged_df = all_fred_dataframes[0]
-        for df in all_fred_dataframes[1:]:
-            merged_df = pd.merge(merged_df, df, left_index=True, right_index=True, how='outer')
+            merged_df = all_fred_dataframes[0]
+            for df in all_fred_dataframes[1:]:
+                merged_df = pd.merge(merged_df, df, left_index=True, right_index=True, how='outer')
 
-        # Data Pre-processing for VAR
-        # 1. Ensure all data is numeric and handle NaNs at the original frequency first
-        merged_df = merged_df.apply(pd.to_numeric, errors='coerce')
-        merged_df.ffill(inplace=True)  # Forward-fill any NaNs
-        merged_df.bfill(inplace=True)  # Backward-fill remaining NaNs (e.g., at the start)
-        merged_df.dropna(inplace=True)  # Drop any rows that are still all NaN after filling
+            # Data Pre-processing for VAR
+            # 1. Ensure all data is numeric and handle NaNs at the original frequency first
+            merged_df = merged_df.apply(pd.to_numeric, errors='coerce')
+            merged_df.ffill(inplace=True)  # Forward-fill any NaNs
+            merged_df.bfill(inplace=True)  # Backward-fill remaining NaNs (e.g., at the start)
+            merged_df.dropna(inplace=True)  # Drop any rows that are still all NaN after filling
 
-        # 2. Resample all series to a consistent quarterly frequency ('QS' - Quarter Start)
-        # Taking the last observation of the quarter for all series
-        merged_df_quarterly = merged_df.resample('QE').last()
+            # 2. Resample all series to a consistent quarterly frequency ('QS' - Quarter Start)
+            # Taking the last observation of the quarter for all series
+            merged_df_quarterly = merged_df.resample('QE').last()
 
-        # 3. Suppress yield into actual value, also convert into spread format
-        # BBB = AAA + BBB_AAA_spread ; AAA = EFFR+ AAA_spread
+            # 3. Suppress yield into actual value, also convert into spread format
+            # BBB = AAA + BBB_AAA_spread ; AAA = EFFR+ AAA_spread
 
-        merged_df_quarterly['AAA_SPREAD_FF'] = merged_df_quarterly['AAAFF'] - merged_df_quarterly['EFFR']
-        merged_df_quarterly['AAA_SPREAD_10Y'] = merged_df_quarterly['AAA10YM'] - merged_df_quarterly['EFFR']
-        merged_df_quarterly['BAA_AAA_SPREAD_FF'] = merged_df_quarterly['BAAFF'] - merged_df_quarterly['AAAFF']
-        merged_df_quarterly['BAA_AAA_SPREAD_10Y'] = merged_df_quarterly['BAA10YM'] - merged_df_quarterly['AAA10YM']
+            merged_df_quarterly['AAA_SPREAD_FF'] = merged_df_quarterly['AAAFF'] - merged_df_quarterly['EFFR']
+            merged_df_quarterly['AAA_SPREAD_10Y'] = merged_df_quarterly['AAA10YM'] - merged_df_quarterly['EFFR']
+            merged_df_quarterly['BAA_AAA_SPREAD_FF'] = merged_df_quarterly['BAAFF'] - merged_df_quarterly['AAAFF']
+            merged_df_quarterly['BAA_AAA_SPREAD_10Y'] = merged_df_quarterly['BAA10YM'] - merged_df_quarterly['AAA10YM']
 
-        # 4. Identify variables that should be log-transformed to ensure no negative rate/spread
-        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF',
-                              'BAA_AAA_SPREAD_10Y']
-        for col in log_transform_vars:
-            if col in merged_df_quarterly.columns:
-                merged_df_quarterly[col] = np.log(merged_df_quarterly[col])
+            # 4. Identify variables that should be log-transformed to ensure no negative curve
+            log_transform_vars = ['EFFR', '10Y', '2Y']
+            for col in log_transform_vars:
+                if col in merged_df_quarterly.columns:
+                    merged_df_quarterly[col] = np.log(merged_df_quarterly[col])
 
-        # 5. add market return
-        spx = yf.Ticker('^GSPC')
-        spx_data = spx.history(period='max')['Close'].resample('QE').last()
-        spx_data.index = spx_data.index.tz_localize(None)
-        new_df = pd.DataFrame(spx_data.pct_change())
-        new_df.dropna(inplace=True)
-        new_df.columns = ['MARKET_RETURN']
+            # 5. add market return
+            spx = yf.Ticker('^GSPC')
+            spx_data = spx.history(period='max')['Close'].resample('QE').last()
+            spx_data.index = spx_data.index.tz_localize(None)
+            new_df = pd.DataFrame(spx_data.pct_change())
+            new_df.dropna(inplace=True)
+            new_df.columns = ['MARKET_RETURN']
 
-        merged_df_quarterly = pd.merge(merged_df_quarterly, new_df, left_index=True, right_index=True, how='left')
+            merged_df_quarterly = pd.merge(merged_df_quarterly, new_df, left_index=True, right_index=True, how='left')
 
-        # All processed series (original and derived) are retained for the VAR model
-        # Drop any remaining NaNs after all transformations.
-        # Exclude the original absolute AAA/BAA yields, include the spreads instead
-        var_columns = [
-            'EMPLOYMENT', 'EFFR', 'FPI', 'GDP', 'GDP_DEF', '10Y', 'M2', 'PCE',
-            'UNEMPLOYMENT', 'PCE_PRICE_INDEX', '2Y', 'USD_INDEX', 'MARKET_RETURN',
-            'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF', 'BAA_AAA_SPREAD_10Y'
-        ]
-        self.processed_data = merged_df_quarterly[var_columns].dropna()
+            # All processed series (original and derived) are retained for the VAR model
+            # Drop any remaining NaNs after all transformations.
+            # Exclude the original absolute AAA/BAA yields, include the spreads instead
+            var_columns = [
+                'EMPLOYMENT', 'EFFR', 'FPI', 'GDP', 'GDP_DEF', '10Y', 'M2', 'PCE',
+                'UNEMPLOYMENT', 'PCE_PRICE_INDEX', '2Y', 'USD_INDEX', 'MARKET_RETURN',
+                'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF', 'BAA_AAA_SPREAD_10Y'
+            ]
+            self.processed_data = merged_df_quarterly[var_columns].dropna()
 
-        if self.processed_data.empty:
-            raise ValueError(
-                "Processed data for VAR model is empty after transformations. Check data availability and transformations.")
+            if self.processed_data.empty:
+                raise ValueError(
+                    "Processed data for VAR model is empty after transformations. Check data availability and transformations.")
 
-        if self.debug:
-            print("Data fetching and preparation complete.")
-            print(f"Prepared data shape for VAR (all variables): {self.processed_data.shape}")
-            print(f"Columns included in VAR model: {self.processed_data.columns.tolist()}")  # Double check print
-            print(self.processed_data.tail())
+            if self.debug:
+                print("Data fetching and preparation complete.")
+                print(f"Prepared data shape for VAR (all variables): {self.processed_data.shape}")
+                print(f"Columns included in VAR model: {self.processed_data.columns.tolist()}")  # Double check print
+                print(self.processed_data.tail())
 
     def _fit_var_model(self):
         """
@@ -215,11 +222,23 @@ class Simulation:
 
         if origin is not None:  # Changed to 'is not None' for clarity
             # Find the integer position of the origin timestamp
+            if origin is not None:
+            # Ensure origin is a pandas Timestamp. If it's a datetime.date, convert it.
+                if isinstance(origin, datetime.date) and not isinstance(origin, datetime.datetime):
+                    origin = pd.Timestamp(origin)
+
+            # Find the closest quarter-end date in your processed_data index
+            # This is more robust than exact get_loc for user-provided dates
             try:
-                # Use get_loc for a single exact match
-                random_start_idx = self.processed_data.index.get_loc(origin)
-            except KeyError:
-                raise ValueError(f"Origin timestamp {origin} not found in processed data index.")
+                # Use asof to find the last valid observation up to and including the origin
+                # Or use BDay/BDay to find the exact business day if required
+                aligned_origin = self.processed_data.index[self.processed_data.index <= origin].max()
+                if pd.isna(aligned_origin):
+                    raise ValueError(f"No data found on or before the origin timestamp {origin}.")
+                random_start_idx = self.processed_data.index.get_loc(aligned_origin)
+                
+            except Exception as e:
+                raise ValueError(f"Could not find a suitable start date for origin {origin}: {e}")
 
             # Ensure there are enough preceding observations for the VAR order
             if random_start_idx < self.var_order:
@@ -320,8 +339,7 @@ class Simulation:
             columns=self.processed_data.columns  # All variables are in the simulated path
         )
         # Inverse Log transformation for non-negative values
-        log_transform_vars = ['EFFR', '10Y', '2Y', 'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF',
-                              'BAA_AAA_SPREAD_10Y']
+        log_transform_vars = ['EFFR', '10Y', '2Y']
         for col in log_transform_vars:
             if col in self.simulated_path.columns:
                 self.simulated_path[col] = np.exp(self.simulated_path[col])
