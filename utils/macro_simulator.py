@@ -52,7 +52,7 @@ class Simulation:
 
         if self.csv_path != "":
             self.processed_data = pd.read_csv(self.csv_path, index_col=0)
-            self.processed_data.index = pd.to_datetime(self.processed_data.index).date()
+            self.processed_data.index = pd.to_datetime(self.processed_data.index)
         else:
             # FRED Data - Combined list of all desired series
             fred_data_sources = {
