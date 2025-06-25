@@ -2,7 +2,7 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 
-def calculate_beta(stock_symbol: str, end_date: pd.Timestamp,market_symbol: str='SPY',years: int = 3) -> float | None:
+def calculate_beta(stock_symbol: str, end_date: pd.Timestamp,market_symbol: str='^GSPC',years: int = 3,market_csv_path:str = "data/GSPC_price.csv",ticker_csv_path:str = 'data/KO_price.csv') -> float | None:
     """
     Calculates the 3-year daily beta of a stock relative to a market ETF.
 
@@ -38,8 +38,18 @@ def calculate_beta(stock_symbol: str, end_date: pd.Timestamp,market_symbol: str=
     # yfinance handles the end of month/year adjustments implicitly.
 
     # Fetch historical data
-    stock_data = yf.download(stock_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_date_str, progress=False)
-    market_data = yf.download(market_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_date_str, progress=False)
+    if ticker_csv_path == "":
+        stock_data = yf.download(stock_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_date_str, progress=False,auto_adjust=True)
+    else:
+        stock_data = pd.read_csv(ticker_csv_path,header =[0,1],index_col=0)
+        stock_data.index = pd.to_datetime(stock_data.index)
+        stock_data = stock_data[(stock_data.index >= start_dt) & (stock_data.index <= end_date)]
+    if market_csv_path == "":
+        market_data = yf.download(market_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_date_str, progress=False,auto_adjust=True)
+    else:
+        market_data = pd.read_csv(market_csv_path, header=[0, 1], index_col=0)
+        market_data.index = pd.to_datetime(market_data.index)
+        market_data = market_data[(market_data.index >= start_dt) & (market_data.index <= end_date)]
 
     # Check if data was fetched successfully
     if stock_data.empty or market_data.empty:
