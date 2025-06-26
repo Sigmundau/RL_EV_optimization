@@ -5,6 +5,27 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 class InterestExpensePredictor:
+    """
+    A class to predict the forward interest expense to debt ratio using macroeconomic and fundamental data.
+
+    This class uses LassoCV for feature selection and LinearRegression for final predictions,
+    trained on preprocessed macroeconomic and company fundamental data with time series cross-validation.
+
+    Parameters:
+    -----------
+    macro_file : str, optional (default="data/macro.csv")
+        Path to the macroeconomic data CSV file. Recommended files: 'data/macro.csv' or 'data/FRED_data.csv'.
+        The file should contain macroeconomic indicators with a date index.
+    fund_file : str, optional (default="data/KO_quarterly.csv")
+        Path to the company fundamental data CSV file containing total liabilities and interest expense.
+
+    Methods:
+    --------
+    predict(new_data=None):
+        Predict the forward interest expense to debt ratio. If new_data is None, uses training data.
+    get_selected_features():
+        Return the list of features selected by LassoCV.
+    """
     def __init__(self, macro_file="data/macro.csv", fund_file="data/KO_quarterly.csv"):
         self.macro_file = macro_file
         self.fund_file = fund_file
@@ -50,6 +71,15 @@ class InterestExpensePredictor:
         test_size = 5
         n_splits = (n_samples - min_train_size) // test_size
 
+        # Ensure n_splits is at least 2
+        if n_splits < 2:
+            n_splits = 2
+            if n_samples < min_train_size + test_size:
+                raise ValueError(
+                    f"Dataset too small: {n_samples} samples. "
+                    f"Need at least {min_train_size + test_size} samples for TimeSeriesSplit."
+                )
+
         # Create expanding window cross-validator
         tscv = TimeSeriesSplit(n_splits=n_splits, test_size=test_size, gap=0)
 
@@ -70,6 +100,10 @@ class InterestExpensePredictor:
         coef = lasso.coef_
         selected_mask = coef != 0
         self.selected_features = self.X.columns[selected_mask]
+
+        # Check if any features were selected
+        if len(self.selected_features) == 0:
+            raise ValueError("LassoCV selected no features. Consider adjusting data or Lasso parameters.")
 
         # Refit OLS on selected features
         new_X = self.X.loc[:, self.selected_features]
