@@ -6,8 +6,7 @@ from functools import reduce
 from statsmodels.tsa.api import VAR
 # from statsmodels.tsa.statespace.varmax import VARMAX # Not yet used, but for VARMA consideration
 from arch import arch_model
-from statsmodels.tools.eval_measures import \
-    rmse  # For potential evaluation, not directly used in simulation but good to have
+from statsmodels.tools.eval_measures import rmse  # For potential evaluation, not directly used in simulation but good to have
 import datetime
 
 
@@ -231,6 +230,9 @@ class Simulation:
             raise RuntimeError("VAR or GARCH models have not been fitted. Call _fit_var_model() first.")
         if self.processed_data is None or self.processed_data.empty:
             raise RuntimeError("Processed data not available. Cannot reset simulation.")
+
+        # adjust for first data point used as origin 
+        path_length += 1
 
         if self.debug:
             print(
@@ -780,6 +782,9 @@ class Dynamic_Simulation:
         
         if self.processed_data is None or self.processed_data.empty:
             raise RuntimeError("Processed data not available. Cannot reset simulation.")
+        
+        # adjust for first data point used as origin 
+        path_length += 1
         
         if self.debug:
             print(f"Resetting joint simulation with a new randomized path of length {path_length} (Quarterly Resolution)...")
