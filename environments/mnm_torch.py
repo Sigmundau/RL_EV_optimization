@@ -240,37 +240,38 @@ class MnM_MVP_torchrl(EnvBase):
         self.debt_lt = max(0.0, self.debt_lt)
 
         self.equity = self.total_asset - (self.debt_st + self.debt_lt)
+        bankrupt = False
         if self.equity <= 0:  # Avoid division by zero or negative equity
-            self.equity = 1e-6  # Small positive number to prevent issues
+            bankrupt = True
+        else:
+            self.beta_U = self.beta_L / (1 + (1 - self.tax_rate) * ((self.debt_st + self.debt_lt) / self.equity))
 
-        self.beta_U = self.beta_L / (1 + (1 - self.tax_rate) * ((self.debt_st + self.debt_lt) / self.equity))
+            # Update CAPM (cost of equity)
+            risk_free_rate = current_macro_data['EFFR'] / 100  # Convert percentage to decimal
+            market_return = current_macro_data['MARKET_RETURN']
+            self.capm.append(risk_free_rate + self.beta_U * max(market_return - risk_free_rate,0))
 
-        # Update CAPM (cost of equity)
-        risk_free_rate = current_macro_data['EFFR'] / 100  # Convert percentage to decimal
-        market_return = current_macro_data['MARKET_RETURN']
-        self.capm.append(risk_free_rate + self.beta_U * max(market_return - risk_free_rate,0))
-
-        cost_of_capital = self.capm[-1]  # Using the latest calculated CAPM
+            cost_of_capital = self.capm[-1]  # Using the latest calculated CAPM
         
         # Check for termination
         terminated = False
         reward = 0.0
         # Only give reward at final step
-        if self.current_step >= self.horizon:
+        if bankrupt:
+            terminated = True
+            reward = -100.0
+        elif self.current_step >= self.horizon:
             terminated = True
             current_ev = 0.0
             if (cost_of_capital - self.g) <= 0:
-                terminal_value = 0
+                terminal_value = 0.0
             else:
                 terminal_value = nopat / (cost_of_capital - self.g)
             for i in range(self.horizon):
                 current_ev += self.nopat[i] / ((1 + self.capm[i]) ** i)
             current_ev += terminal_value
             reward = current_ev / self.nopat[0]  # Normalize reward by initial NOPAT
-        # Add other termination conditions, e.g., bankruptcy (negative equity or too much debt)
-        elif self.equity <= 0 or (self.debt_st + self.debt_lt) > (self.total_asset * 2):  # Example bankruptcy condition
-            terminated = True
-            reward = -100  # Large penalty for bankruptcy
+
 
         observation = self._get_obs()
         
