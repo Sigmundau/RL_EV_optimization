@@ -271,7 +271,7 @@ class MnM_MVP_torchrl(EnvBase):
             else:
                 terminal_value = nopat / (cost_of_capital - self.g)
             for i in range(self.horizon):
-                current_ev += self.nopat[i] / ((1 + self.capm[i]) ** i)
+                current_ev += self.nopat[i] / ((1 + self.capm[i]) ** i/4)
             current_ev += terminal_value
             reward = current_ev / self.nopat[0]  # Normalize reward by initial NOPAT
 

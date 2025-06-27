@@ -149,7 +149,7 @@ def main():
     env = MnM_MVP_torchrl(
         ticker='KO',
         fred_api_key=settings.fred_api_key,
-        simulation_horizon=12, # 12 quarters = 3 years
+        simulation_horizon=4, # 12 quarters = 3 years
         simulation_earliest_origin=datetime.datetime(2010, 1, 1),
         csv_path="data/KO_quarterly.csv",
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
