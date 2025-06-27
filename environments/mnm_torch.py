@@ -11,7 +11,7 @@ import datetime
 from utils.macro_simulator import Simulation,Dynamic_Simulation
 from utils.Company_data_downloader import download_data
 from utils.beta_calculator import calculate_beta
-
+from utils.interest_expense_to_debt_predictor import InterestExpensePredictor
 import settings
 import pandas as pd
 
@@ -21,7 +21,7 @@ from torchrl.data import Unbounded, Categorical, Composite
 import warnings
 
 
-class MnM_MVP_torchrl(EnvBase):
+class MnM_torchrl(EnvBase):
     """
     MnM_MVP is a custom torchrl environment for corporate debt optimization.
     The agent's goal is to manage the firm's debt structure (short-term and long-term debt)
@@ -34,10 +34,11 @@ class MnM_MVP_torchrl(EnvBase):
                  ticker: str,
                  fred_api_key: str,
                  terminal_growth_rate: float = 0.02,
-                 credit_rating: str = 'BAA',
+                 credit_rating: str = 'AAA',
                  simulation_horizon: int = 10,
                  simulation_earliest_origin: datetime.datetime = datetime.datetime(2019, 12, 31),
                  csv_path: str = "data/KO_quarterly.csv",
+                 models_overwrite: dict= None,
                  debug: bool = False,
                  device: str = "cpu"):
         """
@@ -50,6 +51,9 @@ class MnM_MVP_torchrl(EnvBase):
             credit_rating (str): The firm's credit rating ('AAA' or 'BAA').
             simulation_horizon (int): The number of quarters the simulation runs for (episode length).
             simulation_earliest_origin (datetime.datetime): The earliest date possible for the simulation.
+            csv_path (str): Path to the CSV file containing company data. If empty, data will be downloaded.
+            debug (bool): If True, enables debug mode for additional logging.
+            device (str): The device to run the environment on ('cpu' or 'cuda').
         """
         super().__init__(device=device)
         self.debug = debug
@@ -62,6 +66,7 @@ class MnM_MVP_torchrl(EnvBase):
         self.macro_simulator = Dynamic_Simulation(fred_api_key=fred_api_key, var_order=4, debug=self.debug)
         self.simulation_earliest_origin = simulation_earliest_origin
         self.simulation_origin = datetime.datetime.now()
+        self.interest_expense_predictor = interest_expense_predictor
         self.csv_path = csv_path
         self.company_data = None
         self.current_step = 0
@@ -107,7 +112,7 @@ class MnM_MVP_torchrl(EnvBase):
         self.reward_spec = Unbounded(shape=(1,), dtype=torch.float32)
 
 
-    def _reset(self, tensordict):
+    def _reset(self):
         # Find the simulation origin date
         if self.company_data is None:
             if self.csv_path == "":

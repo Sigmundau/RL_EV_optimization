@@ -6,8 +6,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 import gymnasium as gym
 import numpy as np
-from environments.mnm_mvp import MnM_MVP # Import the corrected environment
-from environments.mnm_torch import MnM_MVP_torchrl
+from environments.mnm_mvp_torch import MnM_MVP_torchrl
 import datetime
 import settings
 from torchrl.envs.utils import check_env_specs

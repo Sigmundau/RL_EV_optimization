@@ -5,7 +5,7 @@ import torch
 import pandas as pd
 import numpy as np
 from unittest.mock import MagicMock, patch
-from environments.mnm_torch import MnM_MVP_torchrl
+from environments.mnm_mvp_torch import MnM_MVP_torchrl
 import unittest
 from tensordict import TensorDictBase
 
