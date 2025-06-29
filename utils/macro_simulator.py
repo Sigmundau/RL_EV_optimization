@@ -32,7 +32,8 @@ class Simulation:
         # Define the columns that should be returned by retrieve_next_forecast
         self.default_output_columns = [
             'REAL_GROWTH', 'FX_STRENGTH', 'INFLATION','EFFR','2Y',
-            '10Y', 'AAA_2Y', 'AAA_10Y', 'BAA_2Y', 'BAA_10Y', 'MARKET_RETURN'
+            '10Y', 'AAA_2Y', 'AAA_10Y', 'BAA_2Y', 'BAA_10Y', 'MARKET_RETURN',
+            'EMPLOYMENT', 'PCE', 'GDP', 'FPI','AAA_SPREAD_FF'
         ]
         self.debug = debug
         # Fetch, prepare data, and fit VAR model
@@ -447,7 +448,8 @@ class Dynamic_Simulation:
         # Define the columns that should be returned by retrieve_next_forecast
         self.default_output_columns = [
             'REAL_GROWTH', 'FX_STRENGTH', 'INFLATION','EFFR','2Y',
-            '10Y', 'AAA_2Y', 'AAA_10Y', 'BAA_2Y', 'BAA_10Y', 'MARKET_RETURN'
+            '10Y', 'AAA_2Y', 'AAA_10Y', 'BAA_2Y', 'BAA_10Y', 'MARKET_RETURN',
+            'EMPLOYMENT', 'PCE', 'GDP', 'FPI','AAA_SPREAD_FF'
         ]
         
         self.debug = debug
