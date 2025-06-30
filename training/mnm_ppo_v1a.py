@@ -9,7 +9,7 @@ import datetime
 from collections import deque
 import numpy as np
 from collections import namedtuple
-from environments.mnm_v1 import MnM_v1
+from environments.mnm_v1a import MnM_v1a
 import settings
 from tensordict import TensorDict
 # PPO Hyperparameters
@@ -18,20 +18,20 @@ gamma = 0.99
 lmbda = 0.95
 eps_clip = 0.2
 K_epochs = 4
-T_horizon = 2048
+T_horizon = 512
 mini_batch_size = 64
 
 # Environment parameters (customize as needed)
 ticker = 'KO'
 fred_api_key = settings.fred_api_key  # Ensure this is set in settings.py
 terminal_growth_rate = 0.02
-credit_rating = 'AAA'
+credit_rating = 'A'
 simulation_horizon = 10
 csv_path = "data/KO_quarterly.csv"
 debug = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-env = MnM_v1(
+env = MnM_v1a(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
@@ -99,8 +99,58 @@ class ActorCritic(nn.Module):
         log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
         entropy = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
         return log_probs, entropy, value
+    
+class ImprovedActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim, action_shape):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.action_shape = action_shape
+        # Shared feature extractor
+        self.shared = nn.Sequential(
+            nn.Linear(obs_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128)
+        )
+        
+        # Separate actor and critic heads
+        self.actor = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, act_dim * action_shape)
+        )
+        
+        self.critic = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        
+    def forward(self, x):
+        shared_features = self.shared(x)
+        logits = self.actor(shared_features).view(-1, self.action_shape, self.act_dim)
+        value = self.critic(shared_features)
+        return logits, value
+    def act(self, x):
+        logits, _ = self.forward(x)
+        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
+        actions = torch.stack([dist.sample() for dist in dists], dim=1)
+        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
+        return actions.squeeze(0), log_probs.squeeze(0)
 
-model = ActorCritic(obs_dim, act_dim, action_shape).to(device)
+    def evaluate(self, x, actions):
+        logits, value = self.forward(x)
+        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
+        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
+        entropy = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
+        return log_probs, entropy, value
+    
+# model = ActorCritic(obs_dim, act_dim, action_shape).to(device)
+model = ImprovedActorCritic(obs_dim, act_dim, action_shape).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
 Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'log_prob', 'done'])
@@ -109,35 +159,25 @@ def collect_trajectories(env, model, horizon):
     state = env.reset()
     memory = []
     for _ in range(horizon):
-        # Flatten observation dict to vector
-        state_vec = np.concatenate([state["financial_metrics"], state["macro_economic_data"]])
-        state_tensor = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)
+        # Convert observation dict to torch tensor on GPU
+        state_fin = torch.as_tensor(state["financial_metrics"], dtype=torch.float32, device=device)
+        state_mac = torch.as_tensor(state["macro_economic_data"], dtype=torch.float32, device=device)
+        state_tensor = torch.cat([state_fin, state_mac]).unsqueeze(0)  # shape: (1, obs_dim)
         action, log_prob = model.act(state_tensor)
-        action_np = action.cpu().numpy().squeeze()
+        action_np = action.detach().cpu().numpy().squeeze()
         # Prepare action as TensorDict for TorchRL
-        action_tensor = torch.tensor(action_np, dtype=torch.long, device=device)
+        action_tensor = torch.as_tensor(action_np, dtype=torch.long, device=device)
         action_td = TensorDict({"action": action_tensor}, batch_size=[], device=device)
         step_td = env.step(action_td)
 
         # --- Robust extraction of reward, done, next_state from nested 'next' dicts ---
         td = step_td
-        # descend into 'next' as far as possible
-        while "next" in td and isinstance(td["next"], (dict, TensorDict)):
-            td = td["next"]
-
-        # Try to extract reward and done
-        reward = td["reward"].item() if "reward" in td else (step_td["reward"].item() if "reward" in step_td else 0.0)
-        done = td["done"].item() if "done" in td else (step_td["done"].item() if "done" in step_td else True)
-
-        # Try to extract next_state
-        if "financial_metrics" in td and "macro_economic_data" in td:
-            next_state = {
-                "financial_metrics": td["financial_metrics"].cpu().numpy().squeeze(),
-                "macro_economic_data": td["macro_economic_data"].cpu().numpy().squeeze()
-            }
-        else:
-            # If still not found, reset env (likely episode ended)
-            next_state = env.reset()
+        # print(td.get('next').get('done'))
+        reward = td.get('next').get('reward').item()
+        done = td.get('next').get('done').item()
+        
+        next_state = td.get('next').get('next')
+        # When storing next_state, keep as torch tensors
 
         memory.append(Transition(state, action_np, reward, next_state, log_prob.item(), done))
         state = next_state
@@ -145,22 +185,42 @@ def collect_trajectories(env, model, horizon):
             state = env.reset()
     return memory
 
+def compute_gae(rewards, values, dones, gamma=0.99, lmbda=0.95):
+    """Compute GAE advantages"""
+    advantages = []
+    gae = 0
+    for i in reversed(range(len(rewards))):
+        if i == len(rewards) - 1:
+            nextnonterminal = 1.0 - dones[i]
+            nextvalues = 0
+        else:
+            nextnonterminal = 1.0 - dones[i+1]
+            nextvalues = values[i+1]
+        delta = rewards[i] + gamma * nextvalues * nextnonterminal - values[i]
+        gae = delta + gamma * lmbda * nextnonterminal * gae
+        advantages.insert(0, gae)
+    return torch.tensor(advantages, dtype=torch.float32, device=values.device)
+
 def ppo_update(memory, model, optimizer):
-    # Convert memory to tensors
+    # Convert memory to tensors (all on GPU)
     states_np = np.array([
-        np.concatenate([t.state["financial_metrics"], t.state["macro_economic_data"]]) for t in memory
+    np.concatenate([
+        t.state["financial_metrics"].detach().cpu().numpy() if isinstance(t.state["financial_metrics"], torch.Tensor) else t.state["financial_metrics"],
+        t.state["macro_economic_data"].detach().cpu().numpy() if isinstance(t.state["macro_economic_data"], torch.Tensor) else t.state["macro_economic_data"]
     ])
+    for t in memory
+])
     states = torch.from_numpy(states_np).float().to(device)
     actions_np = np.array([t.action for t in memory])
     actions = torch.from_numpy(actions_np).long().to(device)
-    rewards = [t.reward for t in memory]
-    dones = [t.done for t in memory]
+    rewards = torch.tensor([t.reward for t in memory], dtype=torch.float32, device=device)
+    dones = torch.tensor([t.done for t in memory], dtype=torch.float32, device=device)
     old_log_probs = torch.tensor([t.log_prob for t in memory], dtype=torch.float32, device=device)
 
     # Compute returns and advantages
     returns = []
     G = 0
-    for reward, done in zip(reversed(rewards), reversed(dones)):
+    for reward, done in zip(reversed(rewards.cpu().numpy()), reversed(dones.cpu().numpy())):
         if done:
             G = 0
         G = reward + gamma * G
@@ -169,7 +229,8 @@ def ppo_update(memory, model, optimizer):
     with torch.no_grad():
         _, values = model(states)
         values = values.squeeze()
-    advantages = returns - values
+    advantages = compute_gae(rewards, values, dones, gamma, lmbda)
+    returns = advantages + values
 
     # PPO update
     global writer, global_step
@@ -187,32 +248,36 @@ def ppo_update(memory, model, optimizer):
             loss.backward()
             optimizer.step()
             # TensorBoard logging for losses
-            writer.add_scalar('Loss/actor_loss', actor_loss.item(), global_step)
-            writer.add_scalar('Loss/critic_loss', critic_loss.item(), global_step)
-            writer.add_scalar('Loss/total_loss', loss.item(), global_step)
+            if writer is not None:
+                writer.add_scalar('Loss/actor_loss', actor_loss.item(), global_step)
+                writer.add_scalar('Loss/critic_loss', critic_loss.item(), global_step)
+                writer.add_scalar('Loss/total_loss', loss.item(), global_step)
             global_step += 1
 
-def main():
+def main(log_to_tensorboard=True):
     # TensorBoard setup
-    log_dir = os.path.join("runs", f"mnm_ppo_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(log_dir, exist_ok=True)
-    global writer, global_step
-    writer = SummaryWriter(log_dir)
+    if log_to_tensorboard:
+        log_dir = os.path.join("runs", f"mnm_ppo_v1a_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        os.makedirs(log_dir, exist_ok=True)
+        global writer, global_step
+        writer = SummaryWriter(log_dir)
+        print(f"TensorBoard logs will be saved to: {log_dir}")
+    else:
+        writer = None
     global_step = 0
-    print(f"TensorBoard logs will be saved to: {log_dir}")
     reward_window = deque(maxlen=100)
     for episode in range(1000):
         memory = collect_trajectories(env, model, T_horizon)
-        # Compute episode rewards for this batch
-        episode_rewards = [t.reward for t in memory if t.done]
-        if episode_rewards:
-            reward_window.extend(episode_rewards)
-        if episode % 10 == 0 and len(reward_window) > 0:
-            avg_reward = sum(reward_window) / len(reward_window)
-            print(f"Episode {episode} completed. Rolling avg reward (last 100): {avg_reward:.2f}")
-            writer.add_scalar('Reward/rolling_avg_100', avg_reward, episode)
+        episode_reward = sum(t.reward for t in memory) / len(memory)
+        reward_window.append(episode_reward)
+        if writer is not None:
+            writer.add_scalar('Reward/Episodic Avg Reward', episode_reward, episode)
         ppo_update(memory, model, optimizer)
-    writer.close()
+        if episode % 10 == 0 and len(reward_window) > 0:
+            print(f"Episode {episode} completed. Episodic reward: {episode_reward:.2f}")
+    if writer is not None:
+        writer.close()
 
 if __name__ == "__main__":
-    main()
+    # Set log_to_tensorboard=False to disable logging
+    main(log_to_tensorboard=True)
