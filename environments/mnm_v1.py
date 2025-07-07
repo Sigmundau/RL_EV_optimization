@@ -285,11 +285,14 @@ class MnM_v1(EnvBase):
                 terminal_value = 0.0
             else:
                 terminal_value = nopat / (cost_of_capital - self.g)
-            for i in range(self.horizon):
-                current_ev += self.nopat[i] / ((1 + self.capm[i]) ** (i/4))
-            current_ev += terminal_value
-            reward = current_ev / self.nopat[0]  # Normalize reward by initial NOPAT
-
+            reward = terminal_value/self.nopat[0]  # Normalize reward by initial NOPAT
+            # for i in range(self.horizon):
+            #     current_ev += self.nopat[i] / ((1 + self.capm[i]) ** (i/4))
+            # current_ev += terminal_value
+            # reward = current_ev / self.nopat[0]  # Normalize reward by initial NOPAT
+        else:
+            # mid step reward calculation
+            reward = self.nopat[self.current_step]/ ((1 + self.capm[self.current_step]) ** (self.current_step/4))/self.nopat[0]  # Normalize reward by initial NOPAT
         self.macro_data_lag = current_macro_data
         observation = self._get_obs()
         
@@ -394,8 +397,8 @@ class MnM_v1(EnvBase):
         returns:
         interest_expense (float): Interest expense of the simulation.
         """
-        self.st_interest_expense_ratio = 0.0039167 + -0.00052449 * macro_data['AAA_SPREAD_FF'] + 0.00055024 * self.st_interest_expense_ratio
-        self.lt_interest_expense_ratio = self.st_interest_expense_ratio
+        # self.st_interest_expense_ratio = 0.0039167 + -0.00052449 * macro_data['AAA_SPREAD_FF'] + 0.00055024 * self.st_interest_expense_ratio
+        # self.lt_interest_expense_ratio = self.st_interest_expense_ratio
         return self.debt_lt_lag * self.lt_interest_expense_ratio + self.debt_st_lag * self.st_interest_expense_ratio
 
     def depreciation_model(self):
@@ -434,3 +437,4 @@ class MnM_v1(EnvBase):
         repayment = self.debt_lt / maturity /4
         self.debt_lt -= repayment
         self.debt_st += repayment
+    

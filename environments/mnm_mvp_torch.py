@@ -35,6 +35,7 @@ class MnM_MVP_torchrl(EnvBase):
                  fred_api_key: str,
                  terminal_growth_rate: float = 0.02,
                  credit_rating: str = 'BAA',
+                 fixed_origin:bool = False,
                  simulation_horizon: int = 10,
                  simulation_earliest_origin: datetime.datetime = datetime.datetime(2019, 12, 31),
                  csv_path: str = "data/KO_quarterly.csv",
@@ -64,6 +65,7 @@ class MnM_MVP_torchrl(EnvBase):
         # self.macro_simulator = Simulation(fred_api_key=fred_api_key, var_order=4, debug=self.debug)
         self.macro_simulator = Dynamic_Simulation(fred_api_key=fred_api_key, var_order=4, debug=self.debug)
         self.simulation_earliest_origin = simulation_earliest_origin
+        self.fixed_origin = fixed_origin
         self.simulation_origin = datetime.datetime.now()
         self.csv_path = csv_path
         self.company_data = None
@@ -120,8 +122,12 @@ class MnM_MVP_torchrl(EnvBase):
                 self.company_data = pd.read_csv(self.csv_path, index_col=0)
 
         datelist = self.company_data['fiscalDateEnding'].to_list()
-        datelist_adj = [d for d in datelist if d >= str(self.simulation_earliest_origin)]
-        self.simulation_origin = np.random.choice(datelist_adj)
+        if self.fixed_origin:
+            # If fixed origin, use the earliest date in the dataset
+            self.simulation_origin = self.simulation_earliest_origin
+        else:
+            datelist_adj = [d for d in datelist if d >= str(self.simulation_earliest_origin)]
+            self.simulation_origin = np.random.choice(datelist_adj)
         lag_date = datelist[datelist.index(self.simulation_origin) - 1]
         origin_data = self.company_data.loc[self.company_data['fiscalDateEnding'] == self.simulation_origin]
         lag_data = self.company_data.loc[self.company_data['fiscalDateEnding'] == lag_date]

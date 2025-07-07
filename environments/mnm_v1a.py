@@ -30,7 +30,7 @@ class MnM_v1a(EnvBase):
     Differ from MVP, this environment encompasses a more complex simulation on revenue and interest expense.
     Updates on v1a:
     - Reverted the regression model for interest expense.
-    - Added more choices for debt actions
+    - Added more choices for debt actions (11 discrete actions for each debt type).
     - Updated reward function from final step to mid-step (present value of NOPAT) reward.
     """
     metadata = {'render_modes': ['human']}
@@ -139,7 +139,7 @@ class MnM_v1a(EnvBase):
         datelist = self.company_data['fiscalDateEnding'].to_list()
         datelist_adj = [d for d in datelist if d >= str(self.simulation_earliest_origin)]
         if self.fixed_origin:
-            self.simulation_origin = str(self.simulation_earliest_origin)
+            self.simulation_origin = str(self.simulation_earliest_origin.date())
         else:
             self.simulation_origin = np.random.choice(datelist_adj)
 
@@ -239,13 +239,13 @@ class MnM_v1a(EnvBase):
 
         # Balance Sheet Items Update  
         # Update short-term and long-term debt based on decay models
-        st_repayment = self.st_debt_decay_model()
+        st_mature_repayment = self.st_debt_decay_model()
         self.lt_debt_convert_st_model()
         # Assuming only Cash Flow from Operating and Debt repayment from asset
-        self.total_asset = self.total_asset + nopat - st_repayment
+        self.total_asset = self.total_asset + nopat - st_mature_repayment
 
-        # Map discrete actions (0, 1, 2) to percentage point changes (-0.05, 0.00, 0.05)
-        action_mapping = {i: round(0.02 * i, 2) for i in range(11)}  # 0.00, 0.02, ..., 0.20
+        # Map discrete actions to percentage point changes 
+        action_mapping = {i: round(0.01 * i - 0.05, 2) for i in range(11)}  # 0.00, 0.02, ..., 0.20
         st_debt_adjustment_ratio = action_mapping[action[0]]
         lt_debt_adjustment_ratio = action_mapping[action[1]]
 
@@ -255,6 +255,12 @@ class MnM_v1a(EnvBase):
 
         # update interest expense ratios based on the new debt levels
         self.update_interest_expense_ratio(current_macro_data,delta_debt_st, delta_debt_lt)
+
+        #early repayment of debt
+        if delta_debt_st < 0:
+            self.total_asset -= abs(delta_debt_st)  # Reduce total asset by the repayment amount
+        if delta_debt_lt < 0:
+            self.total_asset -= abs(delta_debt_lt)
 
         # Update debt levels
         self.debt_st += delta_debt_st
@@ -464,6 +470,8 @@ class MnM_v1a(EnvBase):
         st_new_yield = macro_data['AAA_2Y'] + grade * (macro_data['BAA_2Y'] - macro_data['AAA_2Y']) / 3
         
         # Update the interest expense ratio based on the new debt levels
-        self.st_interest_expense_ratio = self.st_interest_expense_ratio * self.debt_st / (delta_st + self.debt_st) + st_new_yield * delta_st / (delta_st + self.debt_st)
-        self.lt_interest_expense_ratio = self.lt_interest_expense_ratio * self.debt_lt / (delta_lt + self.debt_lt) + lt_new_yield * delta_lt / (delta_lt + self.debt_lt)
+        if delta_st>0:
+            self.st_interest_expense_ratio = self.st_interest_expense_ratio * self.debt_st / (delta_st + self.debt_st) + st_new_yield * delta_st / (delta_st + self.debt_st)
+        if delta_lt>0:
+            self.lt_interest_expense_ratio = self.lt_interest_expense_ratio * self.debt_lt / (delta_lt + self.debt_lt) + lt_new_yield * delta_lt / (delta_lt + self.debt_lt)
     
