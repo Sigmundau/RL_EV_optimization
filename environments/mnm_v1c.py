@@ -8,7 +8,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 import datetime
-from utils.macro_simulator import Simulation,Dynamic_Simulation
+from utils.macro_simulator import ECBPoolSimulator
 from utils.Company_data_downloader import download_data
 from utils.beta_calculator import calculate_beta
 from utils.interest_expense_to_debt_predictor import InterestExpensePredictor
@@ -21,17 +21,17 @@ from torchrl.data import Unbounded, Categorical, Composite
 import warnings
 
 
-class MnM_v1a(EnvBase):
+class MnM_v1c(EnvBase):
     """
     MnM_MVP is a custom torchrl environment for corporate debt optimization.
     The agent's goal is to manage the firm's debt structure (short-term and long-term debt)
     to maximize the Enterprise Value (EV). The EV is calculated using a modified
     Modigliani-Miller approach with dynamic inputs from a macroeconomic simulator.
     Differ from MVP, this environment encompasses a more complex simulation on revenue and interest expense.
-    Updates on v1a:
-    - Reverted the regression model for interest expense.
-    - Added more choices for debt actions (11 discrete actions for each debt type).
-    - Updated reward function from final step to mid-step (present value of NOPAT) reward.
+    Updates on v1b vs v1a:
+    - add intermediate reward on leverage
+    - add tracker for leverage ratio
+    - uses ECBPoolSimulator for macroeconomic data
     """
     metadata = {'render_modes': ['human']}
 
@@ -53,6 +53,8 @@ class MnM_v1a(EnvBase):
                  fixed_origin: bool = False,
                  simulation_earliest_origin: datetime.datetime = datetime.datetime(2019, 12, 31),
                  csv_path: str = "data/KO_quarterly.csv",
+                 fixed_path: bool = False,
+                 fixed_path_csv: str = '',
                  debug: bool = False,
                  device: str = "cpu"):
         """
@@ -67,6 +69,8 @@ class MnM_v1a(EnvBase):
             simulation_horizon (int): The number of quarters the simulation runs for (episode length).
             simulation_earliest_origin (datetime.datetime): The earliest date possible for the simulation.
             csv_path (str): Path to the CSV file containing company data. If empty, data will be downloaded.
+            fixed_path (bool):If True, the environment will follow a fixed path of macro simulation, which serves as a fixed env for testing.
+            fixed_path_csv (str): Path to CSV file containing a preset path for uniform testing across algorithms.
             debug (bool): If True, enables debug mode for additional logging.
             device (str): The device to run the environment on ('cpu' or 'cuda').
         """
@@ -78,7 +82,7 @@ class MnM_v1a(EnvBase):
         self.credit_rating = credit_rating.upper()
         self.horizon = simulation_horizon
         self.fixed_origin = fixed_origin
-        self.macro_simulator = Dynamic_Simulation(fred_api_key=fred_api_key, var_order=4, debug=self.debug)
+        self.macro_simulator = ECBPoolSimulator(fred_api_key=fred_api_key, var_order=4, fixed_path=fixed_path,fixed_path_csv=fixed_path_csv,debug=self.debug)
         self.macro_data_lag = None
         self.simulation_earliest_origin = simulation_earliest_origin
         self.simulation_origin = datetime.datetime.now()
@@ -110,7 +114,15 @@ class MnM_v1a(EnvBase):
         self.beta_L = 0.0
         self.capm = []
         self.ev = []
+        self.knockout = False
 
+        # Initial values for normalization
+        self.initial_revenue = 1.0
+        self.initial_total_asset = 1.0
+        self.initial_debt_st = 1.0
+        self.initial_debt_lt = 1.0
+        self.initial_depreciation_amortization = 1.0
+        
         # Action and Observation Specs
         self._make_spec()
 
@@ -173,6 +185,13 @@ class MnM_v1a(EnvBase):
         self.tax_rate = self._to_scalar(origin_data['incomeTaxExpense']) / self._to_scalar(origin_data['incomeBeforeTax'])
         self.ebit = self._to_scalar(origin_data['ebit'])
 
+        # Store initial values for normalization
+        self.initial_revenue = self.revenue
+        self.initial_total_asset = self.total_asset
+        self.initial_debt_st = self.debt_st
+        self.initial_debt_lt = self.debt_lt
+        self.initial_depreciation_amortization = self.depreciation_amortization
+
         # assume same r in mvp
         self.lt_interest_expense_ratio = self.interest_expense / (self.debt_st + self.debt_lt)
         self.st_interest_expense_ratio = self.lt_interest_expense_ratio
@@ -189,7 +208,6 @@ class MnM_v1a(EnvBase):
 
         # Macroeconomic simulator reset
         self.macro_simulator.reset(path_length=self.horizon,
-                                   noise_scale=0.5,
                                    origin=pd.to_datetime(self.simulation_origin).date())
         origin = self.macro_simulator.retrieve_origin_data()
         self.macro_data_lag = origin
@@ -201,12 +219,16 @@ class MnM_v1a(EnvBase):
         self.current_step = 0
 
         observation = self._get_obs()
-      
+        
+        self.knockout = False
+
+
         return TensorDict({
         "financial_metrics": observation["financial_metrics"],
         "macro_economic_data": observation["macro_economic_data"],
         "done": torch.tensor([False]).view(1, 1),
-        "reward": torch.tensor([0.0], dtype=torch.float32).view(1, 1)
+        "reward": torch.tensor([0.0], dtype=torch.float32).view(1, 1),
+        'knockout': torch.tensor([self.knockout], dtype=torch.bool).view(1, 1)
     }, batch_size=self.batch_size, device=self.device)
 
     def _step(self, tensordict: TensorDict):
@@ -220,7 +242,7 @@ class MnM_v1a(EnvBase):
         self.equity_lag = self.equity
 
         # Retrieve macroeconomic data for the current step
-        current_macro_data = self.macro_simulator.retrieve_next_forecast(steps=1).iloc[0]
+        current_macro_data = self.macro_simulator.retrieve_next_forecast(steps=1)
 
         # Update financial metrics based on models and macro data
         self.revenue = self.revenue_model(current_macro_data)
@@ -245,7 +267,7 @@ class MnM_v1a(EnvBase):
         self.total_asset = self.total_asset + nopat - st_mature_repayment
 
         # Map discrete actions to percentage point changes 
-        action_mapping = {i: round(0.01 * i - 0.05, 2) for i in range(11)}  # 0.00, 0.02, ..., 0.20
+        action_mapping = {i: round(0.02 * i - 0.1, 2) for i in range(11)}  # -0.10, -0.08, ..., 0.10
         st_debt_adjustment_ratio = action_mapping[action[0]]
         lt_debt_adjustment_ratio = action_mapping[action[1]]
 
@@ -279,8 +301,9 @@ class MnM_v1a(EnvBase):
             self.beta_U = self.beta_L / (1 + (1 - self.tax_rate) * ((self.debt_st + self.debt_lt) / self.equity))
 
             # Update CAPM (cost of equity)
-            risk_free_rate = current_macro_data['EFFR'] / 100.0  # Convert percentage to decimal
+            risk_free_rate = current_macro_data['EFFR']
             market_return = current_macro_data['MARKET_RETURN']
+
             self.capm.append(risk_free_rate + self.beta_U * max(market_return - risk_free_rate,0))
 
             cost_of_capital = self.capm[-1]  # Using the latest calculated CAPM
@@ -288,23 +311,25 @@ class MnM_v1a(EnvBase):
         # Check for termination
         terminated = False
         reward = 0.0
+
         # Only give reward at final step
         if bankrupt:
             terminated = True
-            reward = -100.0
+            reward = -20.0
         elif self.current_step >= self.horizon:
             terminated = True
             if (cost_of_capital - self.g) <= 0:
                 terminal_value = 0.0
             else:
                 terminal_value = nopat / (cost_of_capital - self.g)
+            terminal_value /= (1+cost_of_capital) ** (self.horizon/4) #Discounting Terminal value to present value
             reward = terminal_value/self.nopat[0]  # Normalize reward by initial NOPAT
         else:
             # mid step reward calculation
             reward = self.nopat[self.current_step]/ ((1 + self.capm[self.current_step]) ** (self.current_step/4))/self.nopat[0]  # Normalize reward by initial NOPAT
         self.macro_data_lag = current_macro_data
         observation = self._get_obs()
-        
+
         out_tensordict = TensorDict(
         source={
             "next": TensorDict({
@@ -313,6 +338,7 @@ class MnM_v1a(EnvBase):
             }, batch_size=self.batch_size, device=self.device),
             "reward": torch.tensor([self._to_scalar(reward)], dtype=torch.float32).view(1, 1),
             "done": torch.tensor([terminated]).view(1, 1),
+            'knockout': torch.tensor([self.knockout], dtype=torch.bool).view(1, 1)
         },
         batch_size=self.batch_size,
         device=self.device
@@ -325,23 +351,21 @@ class MnM_v1a(EnvBase):
         Helper to get the current observation.
         """
         financial_metrics = torch.tensor([
-            self._to_scalar(self.revenue),
+            self._to_scalar(self.revenue) / self.initial_revenue,
             self._to_scalar(self.cogs_ratio),
             self._to_scalar(self.opex_ratio),
             self._to_scalar(self.interest_income_ratio),
             self._to_scalar(self.lt_interest_expense_ratio),
             self._to_scalar(self.st_interest_expense_ratio),
-            self._to_scalar(self.depreciation_amortization),
+            self._to_scalar(self.depreciation_amortization) / self.initial_depreciation_amortization,
             self._to_scalar(self.tax_rate),
-            self._to_scalar(self.total_asset),
-            self._to_scalar(self.debt_st),
-            self._to_scalar(self.debt_lt)
+            self._to_scalar(self.total_asset) / self.initial_total_asset,
+            self._to_scalar(self.debt_st) / self.initial_debt_st if self.initial_debt_st != 0 else 0,
+            self._to_scalar(self.debt_lt) / self.initial_debt_lt if self.initial_debt_lt != 0 else 0
         ], dtype=torch.float32)
 
-        # Retrieve the current macroeconomic forecast
-        macro_data_df = self.macro_simulator.retrieve_next_forecast(steps=1)
-        macro_economic_data = torch.tensor(macro_data_df.iloc[0][self.macro_simulator.default_output_columns].values,
-            dtype=torch.float32)
+        # Always convert the Series to a 1D tensor of macro features
+        macro_economic_data = torch.tensor(self.macro_data_lag.values[0], dtype=torch.float32)
 
         return {
             "financial_metrics": financial_metrics,
@@ -364,13 +388,14 @@ class MnM_v1a(EnvBase):
         returns:
         revenue (float): Revenue of the simulation.
         """
-        employmentqoq = (macro_data['EMPLOYMENT'] - self.macro_data_lag['EMPLOYMENT'] )/ self.macro_data_lag['EMPLOYMENT']
+
+        employmentqoq = (macro_data['EMPLOYMENT']- self.macro_data_lag['EMPLOYMENT'] )/ self.macro_data_lag['EMPLOYMENT']
         fpiqoq = (macro_data['FPI'] - self.macro_data_lag['FPI']) / self.macro_data_lag['FPI']
         gdpqoq = (macro_data['GDP'] - self.macro_data_lag['GDP']) / self.macro_data_lag['GDP']
         pceqoq = (macro_data['PCE'] - self.macro_data_lag['PCE']) / self.macro_data_lag['PCE']
         # Coefficients based on historical data
         change_pct = 0.006228 - 6.227505 *employmentqoq +1.728589 * fpiqoq -4.443587 * gdpqoq + 9.625248 * pceqoq
-        return self.revenue * (1 + change_pct)
+        return self.revenue * (1 + change_pct/4)
 
     def cogs_model(self):
         """
@@ -419,7 +444,7 @@ class MnM_v1a(EnvBase):
         """
         return self.depreciation_amortization
     
-    def st_debt_decay_model(self, maturity: int = 3):
+    def st_debt_decay_model(self, maturity: int = 1):
         """
         Simple model for short-term debt decay, assuming linear decay to zero over a specified maturity period.
 
@@ -468,10 +493,11 @@ class MnM_v1a(EnvBase):
         # Yield based on the credit rating
         lt_new_yield = macro_data['AAA_10Y'] + grade * (macro_data['BAA_10Y'] - macro_data['AAA_10Y']) / 3
         st_new_yield = macro_data['AAA_2Y'] + grade * (macro_data['BAA_2Y'] - macro_data['AAA_2Y']) / 3
-        
+        lt_new_yield/= 100  # Convert from percentage
+        st_new_yield/= 100  # Convert from percentage
+
         # Update the interest expense ratio based on the new debt levels
         if delta_st>0:
             self.st_interest_expense_ratio = self.st_interest_expense_ratio * self.debt_st / (delta_st + self.debt_st) + st_new_yield * delta_st / (delta_st + self.debt_st)
         if delta_lt>0:
             self.lt_interest_expense_ratio = self.lt_interest_expense_ratio * self.debt_lt / (delta_lt + self.debt_lt) + lt_new_yield * delta_lt / (delta_lt + self.debt_lt)
-    

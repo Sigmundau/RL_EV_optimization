@@ -9,7 +9,7 @@ import datetime
 from collections import deque
 import numpy as np
 from collections import namedtuple
-from environments.mnm_v1b import MnM_v1b
+from environments.mnm_v1c import MnM_v1c
 import settings
 from tensordict import TensorDict
 # PPO Hyperparameters
@@ -21,6 +21,7 @@ K_epochs = 4
 T_horizon = 256
 mini_batch_size = 64
 
+
 # Environment parameters (customize as needed)
 ticker = 'KO'
 fred_api_key = settings.fred_api_key  # Ensure this is set in settings.py
@@ -30,13 +31,16 @@ simulation_horizon = 10
 csv_path = "data/KO_quarterly.csv"
 debug = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-env = MnM_v1b(
+log_dir = os.path.join("runs", "2013_v1b_fixed")
+env = MnM_v1c(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
     credit_rating=credit_rating,
-    fixed_origin=False,
+    # fixed_origin=False,
+    # simulation_earliest_origin = datetime.datetime(2007, 6, 30),
+    fixed_origin=True,
+    simulation_earliest_origin = datetime.datetime(2013, 6, 30),
     simulation_horizon=simulation_horizon,
     csv_path=csv_path,
     fixed_path=False,  # Training env: random path
@@ -45,7 +49,7 @@ env = MnM_v1b(
 )
 
 # Fixed-path environment for evaluation
-eval_env = MnM_v1b(
+eval_env = MnM_v1c(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
@@ -54,10 +58,11 @@ eval_env = MnM_v1b(
     simulation_horizon=simulation_horizon,
     csv_path=csv_path,
     fixed_path=True,  # Evaluation env: fixed path
-    fixed_path_csv='data/simulated_path_10step.csv',
+    fixed_path_csv='data/20131231_real_path.csv',
     debug=debug,
     device=device.type
 )
+
 
 
 # Retrieve observation and action shapes from env.reset() and action_spec
@@ -227,7 +232,6 @@ class ImprovedActorCritic(nn.Module):
         log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
         entropy = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
         return log_probs, entropy, value
-
 # model = ActorCritic(obs_dim, act_dim, action_shape).to(device)
 model = ImprovedActorCritic(obs_dim, act_dim, action_shape).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -253,6 +257,7 @@ def collect_trajectories(env, model, horizon):
     # Determine expected macro_economic_data length from initial obs
     expected_macro_dim = len(state["macro_economic_data"])
     for _ in range(horizon):
+
         # Convert observation dict to torch tensor on GPU, always flatten to 1D
         state_fin = torch.as_tensor(state["financial_metrics"], dtype=torch.float32, device=device).flatten()
         state_mac_raw = state["macro_economic_data"]
@@ -397,7 +402,7 @@ def main(log_to_tensorboard=True):
     """
     # TensorBoard setup
     if log_to_tensorboard:
-        log_dir = os.path.join("runs", f"mnm_ppo_v1b_float_10step_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        # log_dir = os.path.join("runs", f"mnm_ppo_v1b_float_10step_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(log_dir, exist_ok=True)
         global writer, global_step
         writer = SummaryWriter(log_dir)
@@ -438,9 +443,6 @@ def eval_fixed_path(model, eval_env, simulation_horizon, device, test_step, writ
 
     Returns:
         None
-    """
-    """
-    Run 1 full episode on the fixed-path environment and log results to TensorBoard if writer is provided.
     """
     eval_rewards = []
     eval_knockout_count = 0

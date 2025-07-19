@@ -9,25 +9,50 @@ import datetime
 from collections import deque
 import numpy as np
 from collections import namedtuple
-from environments.mnm_v1b import MnM_v1b
+from environments.mnm_v1c import MnM_v1c
 import settings
 from tensordict import TensorDict
+
 # PPO Hyperparameters
-base_learning_rate = 1e-4  # Will be annealed
-learning_rate = base_learning_rate
+learning_rate = 1e-4
 gamma = 1
 lmbda = 0.95
-
 eps_clip = 0.2
 K_epochs = 4
 T_horizon = 256
 mini_batch_size = 64
-max_grad_norm = 0.5  # Gradient clipping
-value_clip = 0.2     # Value function clipping
-total_episodes = 1000
-entropy_coef = 0.01
-entropy_coef_start = 0.01
-entropy_coef_end = 0.0
+max_grad_norm = 0.5  # For gradient clipping
+adam_epsilon = 1e-5  # Adam epsilon parameter
+reward_scale = 1.0  # Reward scaling factor
+
+# Running mean/std for state and reward normalization
+class RunningMeanStd:
+    def __init__(self, shape):
+        self.mean = np.zeros(shape, 'float64')
+        self.var = np.ones(shape, 'float64')
+        self.count = 1e-4
+    def update(self, x):
+        x = np.asarray(x)
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+    def normalize(self, x):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+state_rms = None  # Will be initialized after obs_dim is known
+reward_rms = RunningMeanStd(())
 
 # Environment parameters (customize as needed)
 ticker = 'KO'
@@ -38,13 +63,16 @@ simulation_horizon = 10
 csv_path = "data/KO_quarterly.csv"
 debug = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-env = MnM_v1b(
+log_dir = os.path.join("runs", "2013_v1c_fixed")
+env = MnM_v1c(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
     credit_rating=credit_rating,
+    # fixed_origin=False,
+    # simulation_earliest_origin = datetime.datetime(2007, 6, 30),
     fixed_origin=True,
+    simulation_earliest_origin = datetime.datetime(2013, 6, 30),
     simulation_horizon=simulation_horizon,
     csv_path=csv_path,
     fixed_path=False,  # Training env: random path
@@ -53,7 +81,7 @@ env = MnM_v1b(
 )
 
 # Fixed-path environment for evaluation
-eval_env = MnM_v1b(
+eval_env = MnM_v1c(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
@@ -62,7 +90,7 @@ eval_env = MnM_v1b(
     simulation_horizon=simulation_horizon,
     csv_path=csv_path,
     fixed_path=True,  # Evaluation env: fixed path
-    fixed_path_csv='data/simulated_path_10step.csv',
+    fixed_path_csv='data/20131231_real_path.csv',
     debug=debug,
     device=device.type
 )
@@ -86,82 +114,21 @@ else:
     raise ValueError("Could not determine action shape from action_spec.shape.")
 
 
+
 # Multi-categorical actor-critic for 2D categorical action
+import torch.nn.init as init
 
-class ActorCritic(nn.Module):
-    """
-    Standard multi-categorical actor-critic network for PPO.
-    The actor outputs logits for each action dimension; the critic outputs a state value.
-    """
-    def __init__(self, obs_dim, act_dim, action_shape):
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-        self.action_shape = action_shape
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.Linear(64, act_dim * action_shape)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        """
-        Forward pass for the actor-critic network.
-        Args:
-            x (torch.Tensor): Input observation tensor.
-        Returns:
-            logits (torch.Tensor): Action logits for each action dimension.
-            value (torch.Tensor): State value estimate.
-        """
-        logits = self.actor(x).view(-1, self.action_shape, self.act_dim)
-        value = self.critic(x)
-        return logits, value
-
-    def act(self, x):
-        """
-        Samples actions and computes log probabilities for the given observation.
-        Args:
-            x (torch.Tensor): Input observation tensor.
-        Returns:
-            actions (torch.Tensor): Sampled actions.
-            log_probs (torch.Tensor): Log probabilities of the sampled actions.
-        """
-        logits, _ = self.forward(x)
-        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
-        actions = torch.stack([dist.sample() for dist in dists], dim=1)
-        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
-        return actions.squeeze(0), log_probs.squeeze(0)
-
-    def evaluate(self, x, actions):
-        """
-        Evaluates the log probabilities, entropy, and value for given states and actions.
-        Args:
-            x (torch.Tensor): Input observation tensor.
-            actions (torch.Tensor): Actions to evaluate.
-        Returns:
-            log_probs (torch.Tensor): Log probabilities of the actions.
-            entropy (torch.Tensor): Entropy of the action distributions.
-            value (torch.Tensor): State value estimate.
-        """
-        logits, value = self.forward(x)
-        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
-        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
-        entropy = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
-        return log_probs, entropy, value
+def orthogonal_init(module):
+    if isinstance(module, nn.Linear):
+        init.orthogonal_(module.weight)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
 
 class ImprovedActorCritic(nn.Module):
     """
     Improved multi-categorical actor-critic network with a shared feature extractor,
     separate actor and critic heads, and dropout for regularization.
+    Uses Tanh activations and orthogonal initialization.
     """
     def __init__(self, obs_dim, act_dim, action_shape):
         super().__init__()
@@ -171,48 +138,34 @@ class ImprovedActorCritic(nn.Module):
         # Shared feature extractor
         self.shared = nn.Sequential(
             nn.Linear(obs_dim, 256),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
             nn.Linear(256, 256),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
-            nn.Linear(256, 128)
+            nn.Linear(256, 128),
+            nn.Tanh()
         )
         # Separate actor and critic heads
         self.actor = nn.Sequential(
             nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(128, act_dim * action_shape)
         )
         self.critic = nn.Sequential(
             nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(128, 1)
         )
+        self.apply(orthogonal_init)
 
     def forward(self, x):
-        """
-        Forward pass for the improved actor-critic network.
-        Args:
-            x (torch.Tensor): Input observation tensor.
-        Returns:
-            logits (torch.Tensor): Action logits for each action dimension.
-            value (torch.Tensor): State value estimate.
-        """
         shared_features = self.shared(x)
         logits = self.actor(shared_features).view(-1, self.action_shape, self.act_dim)
         value = self.critic(shared_features)
         return logits, value
 
     def act(self, x):
-        """
-        Samples actions and computes log probabilities for the given observation.
-        Args:
-            x (torch.Tensor): Input observation tensor.
-        Returns:
-            actions (torch.Tensor): Sampled actions.
-            log_probs (torch.Tensor): Log probabilities of the sampled actions.
-        """
         logits, _ = self.forward(x)
         dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
         actions = torch.stack([dist.sample() for dist in dists], dim=1)
@@ -220,16 +173,6 @@ class ImprovedActorCritic(nn.Module):
         return actions.squeeze(0), log_probs.squeeze(0)
 
     def evaluate(self, x, actions):
-        """
-        Evaluates the log probabilities, entropy, and value for given states and actions.
-        Args:
-            x (torch.Tensor): Input observation tensor.
-            actions (torch.Tensor): Actions to evaluate.
-        Returns:
-            log_probs (torch.Tensor): Log probabilities of the actions.
-            entropy (torch.Tensor): Entropy of the action distributions.
-            value (torch.Tensor): State value estimate.
-        """
         logits, value = self.forward(x)
         dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
         log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
@@ -237,9 +180,11 @@ class ImprovedActorCritic(nn.Module):
         return log_probs, entropy, value
 
 # model = ActorCritic(obs_dim, act_dim, action_shape).to(device)
-
 model = ImprovedActorCritic(obs_dim, act_dim, action_shape).to(device)
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate, eps=adam_epsilon)
+
+# Learning rate scheduler for decay
+lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1 - epoch / 1000)
 
 Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'log_prob', 'done'])
 
@@ -272,7 +217,15 @@ def collect_trajectories(env, model, horizon):
             state_mac = torch.cat([state_mac, torch.zeros(pad_len, dtype=state_mac.dtype, device=state_mac.device)])
         elif state_mac.shape[0] > expected_macro_dim:
             state_mac = state_mac[:expected_macro_dim]
-        state_tensor = torch.cat([state_fin, state_mac]).unsqueeze(0)  # shape: (1, obs_dim)
+        state_np = torch.cat([state_fin, state_mac]).cpu().numpy()
+        # State normalization (update running stats)
+        global state_rms
+        if state_rms is not None:
+            state_rms.update([state_np])
+            state_np_norm = state_rms.normalize(state_np)
+        else:
+            state_np_norm = state_np
+        state_tensor = torch.as_tensor(state_np_norm, dtype=torch.float32, device=device).unsqueeze(0)
         action, log_prob = model.act(state_tensor)
         action_np = action.detach().cpu().numpy().squeeze()
         # Prepare action as TensorDict for TorchRL
@@ -294,7 +247,7 @@ def collect_trajectories(env, model, horizon):
             state = env.reset()
     return memory, knockout_count
 
-def compute_gae(rewards, values, dones, gamma=0.99, lmbda=0.95, next_value=0.0):
+def compute_gae(rewards, values, dones, gamma=0.99, lmbda=0.95):
     """
     Computes Generalized Advantage Estimation (GAE) for a batch of rewards and values.
 
@@ -314,16 +267,19 @@ def compute_gae(rewards, values, dones, gamma=0.99, lmbda=0.95, next_value=0.0):
     for i in reversed(range(len(rewards))):
         if i == len(rewards) - 1:
             nextnonterminal = 1.0 - dones[i]
-            nextvalues = next_value
+            nextvalues = 0
         else:
             nextnonterminal = 1.0 - dones[i+1]
             nextvalues = values[i+1]
         delta = rewards[i] + gamma * nextvalues * nextnonterminal - values[i]
         gae = delta + gamma * lmbda * nextnonterminal * gae
         advantages.insert(0, gae)
-    return torch.tensor(advantages, dtype=torch.float32, device=values.device)
+    advantages = torch.tensor(advantages, dtype=torch.float32, device=values.device)
+    # Advantage normalization (Trick 1)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    return advantages
 
-def ppo_update(memory, model, optimizer, current_episode, total_episodes):
+def ppo_update(memory, model, optimizer):
     """
     Performs a PPO update step using the collected batch of transitions.
 
@@ -339,6 +295,7 @@ def ppo_update(memory, model, optimizer, current_episode, total_episodes):
         arr = arr.detach().cpu().numpy() if isinstance(arr, torch.Tensor) else arr
         arr = np.atleast_1d(arr)
         return arr
+
     states_np = []
     for t in memory:
         fin = to_1d_np(t.state["financial_metrics"])
@@ -349,85 +306,66 @@ def ppo_update(memory, model, optimizer, current_episode, total_episodes):
             mac = np.concatenate([mac, np.zeros(expected_macro_dim - mac.shape[0], dtype=mac.dtype)])
         elif mac.shape[0] > expected_macro_dim:
             mac = mac[:expected_macro_dim]
-        states_np.append(np.concatenate([fin, mac]))
+        state_vec = np.concatenate([fin, mac])
+        # State normalization (Trick 2)
+        global state_rms
+        if state_rms is not None:
+            state_rms.update([state_vec])
+            state_vec = state_rms.normalize(state_vec)
+        states_np.append(state_vec)
     states_np = np.array(states_np)
     states = torch.from_numpy(states_np).float().to(device)
     actions_np = np.array([t.action for t in memory])
     actions = torch.from_numpy(actions_np).long().to(device)
-    rewards = torch.tensor([t.reward for t in memory], dtype=torch.float32, device=device)
+    rewards_np = np.array([t.reward for t in memory], dtype=np.float32)
+    # Reward normalization and scaling (Trick 3 & 4)
+    global reward_rms
+    reward_rms.update(rewards_np)
+    rewards_np = reward_rms.normalize(rewards_np) * reward_scale
+    rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device)
     dones = torch.tensor([t.done for t in memory], dtype=torch.float32, device=device)
     old_log_probs = torch.tensor([t.log_prob for t in memory], dtype=torch.float32, device=device)
 
-
-    # Compute returns and advantages (with bootstrapped value for last state)
+    # Compute returns and advantages
+    returns = []
+    G = 0
+    for reward, done in zip(reversed(rewards.cpu().numpy()), reversed(dones.cpu().numpy())):
+        if done:
+            G = 0
+        G = reward + gamma * G
+        returns.insert(0, G)
+    returns = torch.tensor(returns, dtype=torch.float32, device=device)
     with torch.no_grad():
         _, values = model(states)
         values = values.squeeze()
-        # Bootstrap value for last state
-        last_state = memory[-1].next_state
-        fin = last_state["financial_metrics"]
-        mac = last_state["macro_economic_data"]
-        # Convert to numpy arrays if they are tensors
-        if isinstance(fin, torch.Tensor):
-            fin = fin.cpu().numpy()
-        fin = np.atleast_1d(fin)
-        if isinstance(mac, torch.Tensor):
-            mac = mac.cpu().numpy()
-        mac = np.atleast_1d(mac)
-        if mac.shape[0] < expected_macro_dim:
-            mac = np.concatenate([mac, np.zeros(expected_macro_dim - mac.shape[0], dtype=mac.dtype)])
-        elif mac.shape[0] > expected_macro_dim:
-            mac = mac[:expected_macro_dim]
-        last_state_tensor = torch.from_numpy(np.concatenate([fin, mac])).float().unsqueeze(0).to(device)
-        _, next_value = model(last_state_tensor)
-        next_value = next_value.squeeze().item()
-    advantages = compute_gae(rewards, values, dones, gamma, lmbda, next_value)
-    # Advantage normalization (ICLR trick)
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages = compute_gae(rewards, values, dones, gamma, lmbda)
     returns = advantages + values
 
-    # Anneal learning rate
-    frac = 1.0 - (current_episode / total_episodes)
-    lr_now = base_learning_rate * frac
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr_now
-
-    # Anneal entropy coefficient
-    entropy_coef_now = entropy_coef_start + frac * (entropy_coef_end - entropy_coef_start)
-
-    # Shuffle indices for minibatch
-    indices = np.arange(len(memory))
+    # PPO update
     global writer, global_step
     for _ in range(K_epochs):
-        np.random.shuffle(indices)
         for i in range(0, len(memory), mini_batch_size):
-            idx = indices[i:i + mini_batch_size]
-            idx = torch.tensor(idx, dtype=torch.long, device=device)
+            idx = slice(i, i + mini_batch_size)
             log_probs, entropy, value = model.evaluate(states[idx], actions[idx])
             ratio = torch.exp(log_probs - old_log_probs[idx])
             surr1 = ratio * advantages[idx]
             surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages[idx]
             actor_loss = -torch.min(surr1, surr2).mean()
-            # Value function clipping (ICLR trick)
-            value_pred = value.squeeze()
-            value_pred_clipped = values[idx] + (value_pred - values[idx]).clamp(-value_clip, value_clip)
-            critic_loss1 = (value_pred - returns[idx]).pow(2)
-            critic_loss2 = (value_pred_clipped - returns[idx]).pow(2)
-            critic_loss = 0.5 * torch.max(critic_loss1, critic_loss2).mean()
-            loss = actor_loss + critic_loss - entropy_coef_now * entropy.mean()
+            critic_loss = nn.MSELoss()(value.squeeze(), returns[idx])
+            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy.mean()
             optimizer.zero_grad()
             loss.backward()
-            # Gradient clipping (ICLR trick)
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            # Gradient clipping (Trick 7)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             # TensorBoard logging for losses
             if writer is not None:
                 writer.add_scalar('Loss/actor_loss', actor_loss.item(), global_step)
                 writer.add_scalar('Loss/critic_loss', critic_loss.item(), global_step)
                 writer.add_scalar('Loss/total_loss', loss.item(), global_step)
-                writer.add_scalar('Loss/lr', lr_now, global_step)
-                writer.add_scalar('Loss/entropy_coef', entropy_coef_now, global_step)
             global_step += 1
+    # Learning rate decay (Trick 6)
+    lr_scheduler.step()
 
 
 def main(log_to_tensorboard=True):
@@ -440,7 +378,7 @@ def main(log_to_tensorboard=True):
     """
     # TensorBoard setup
     if log_to_tensorboard:
-        log_dir = os.path.join("runs", f"mnm_ppo_v1c_fixed_10step_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        # log_dir = os.path.join("runs", f"mnm_ppo_v1d_float_10step_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(log_dir, exist_ok=True)
         global writer, global_step
         writer = SummaryWriter(log_dir)
@@ -451,7 +389,9 @@ def main(log_to_tensorboard=True):
     test_step = 0
     reward_window = deque(maxlen=100)
     # --- Training loop ---
-    for episode in range(total_episodes):
+    global state_rms
+    state_rms = RunningMeanStd(obs_dim)
+    for episode in range(1000):
         memory, knockout_count = collect_trajectories(env, model, T_horizon)
         episode_reward = sum(t.reward for t in memory) / len(memory)
         reward_window.append(episode_reward)
@@ -460,11 +400,11 @@ def main(log_to_tensorboard=True):
             writer.add_scalar('Reward/Episodic Avg Reward', episode_reward, episode)
             writer.add_scalar('Env/Knockout Percentage', knockout_pct, episode)
             writer.flush()
-        ppo_update(memory, model, optimizer, episode, total_episodes)
+        ppo_update(memory, model, optimizer)
         if episode % 10 == 0 and len(reward_window) > 0:
             print(f"Episode {episode} completed. Episodic reward: {episode_reward:.2f} | Knockout %: {knockout_pct:.2%}")
             # --- Evaluation on fixed-path environment ---
-            eval_fixed_path(model, eval_env, simulation_horizon, device, test_step, writer)
+            eval_fixed_path(model, eval_env, simulation_horizon, device, test_step,writer)
             test_step += 1
     if writer is not None:
         writer.close()

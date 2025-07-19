@@ -307,6 +307,7 @@ class MnM_v1b(EnvBase):
                 terminal_value = 0.0
             else:
                 terminal_value = nopat / (cost_of_capital - self.g)
+            terminal_value /= (1+cost_of_capital) ** (self.horizon/4) #Discounting Terminal value to present value
             reward = terminal_value/self.nopat[0]  # Normalize reward by initial NOPAT
         else:
             # mid step reward calculation
@@ -428,7 +429,7 @@ class MnM_v1b(EnvBase):
         """
         return self.depreciation_amortization
     
-    def st_debt_decay_model(self, maturity: int = 3):
+    def st_debt_decay_model(self, maturity: int = 1):
         """
         Simple model for short-term debt decay, assuming linear decay to zero over a specified maturity period.
 

@@ -8,10 +8,10 @@ class ECBPoolSimulator:
     """
     ECBPoolSimulator simulates macroeconomic variables using a combination of VAR and toy DSGE models.
     It fetches, processes, and simulates macroeconomic time series data, supporting both real-time data
-    from FRED and local CSVs. The simulator can generate future macroeconomic scenarios for use in
+    from FRED. The simulator can generate future macroeconomic scenarios for use in
     reinforcement learning or economic modeling.
     """
-    def __init__(self, fred_api_key, var_order=4, debug=False,fixed_path = False, fred_csv_path="",fixed_path_csv=""):
+    def __init__(self, fred_api_key, var_order=4, debug=False,fixed_path = False, fixed_path_csv=""):
         """
         Initialize the ECBPoolSimulator.
         
@@ -20,13 +20,11 @@ class ECBPoolSimulator:
             var_order (int): Order of the VAR model.
             debug (bool): If True, print debug information.
             fixed_path (bool): If True, return the same simulated path, used for benchmark comparison
-            fred_csv_path (str): Optional path to a CSV file with pre-fetched FRED data.
             fixed_path_csv(str): Optional path to a CSV file with a pretrained simulation path for uniform purpose.
         """
         self.debug = debug
         self.fred = Fred(fred_api_key)
         self.var_order = var_order
-        self.fred_csv_path = fred_csv_path
         self.processed_data = None
         self.differenced_data = None
         self.last_observed_level = None
@@ -51,65 +49,62 @@ class ECBPoolSimulator:
         """
         if self.debug:
             print("Fetching and preparing data...")
-        if self.fred_csv_path != "":
-            self.processed_data = pd.read_csv(self.fred_csv_path, index_col=0)
-            self.processed_data.index = pd.to_datetime(self.processed_data.index)
-        else:
-            fred_data_sources = {
-                'AAA_SPREAD_FF': 'AAAFF',
-                'AAA_SPREAD_10Y': 'AAA10YM',
-                'BAA_SPREAD_FF': 'BAAFF',
-                'BAA_SPREAD_10Y': 'BAA10YM',
-                'EMPLOYMENT': 'CE16OV',
-                'EFFR': 'FEDFUNDS',
-                'FPI': 'FPI',
-                'GDP': 'GDP',
-                'GDP_DEF': 'GDPDEF',
-                '10Y': 'GS10',
-                'M2': 'M2SL',
-                'PCE': 'PCEC',
-                'UNEMPLOYMENT': 'UNRATE',
-                'PCE_PRICE_INDEX': 'PCEPI',
-                '2Y': 'GS2',
-            }
-            twexb = self.fred.get_series('TWEXB')
-            dtwexbgs = self.fred.get_series('DTWEXBGS')
-            overlap_start = max(twexb.index.min(), dtwexbgs.index.min())
-            scale = dtwexbgs.loc[dtwexbgs.index==overlap_start] / twexb.loc[twexb.index==overlap_start]
-            twexb_rebased = twexb * scale
-            combined_usd_index = pd.concat([
-                twexb_rebased.loc[:overlap_start - pd.Timedelta(days=1)],
-                dtwexbgs.loc[overlap_start:]
-            ])
-            all_fred_dataframes = [pd.DataFrame(combined_usd_index, columns=['USD_INDEX'])]
-            for col_name, series_id in fred_data_sources.items():
-                df = pd.DataFrame(self.fred.get_series(series_id), columns=[col_name])
-                all_fred_dataframes.append(df)
-            merged_df = pd.concat(all_fred_dataframes, axis=1, join='outer')
-            merged_df = merged_df.apply(pd.to_numeric, errors='coerce')
-            merged_df.dropna(inplace=True)
-            merged_df_quarterly = merged_df.resample('QE').last()
-            merged_df_quarterly['BAA_AAA_SPREAD_FF'] = merged_df_quarterly['BAA_SPREAD_FF'] - merged_df_quarterly['AAA_SPREAD_FF']
-            merged_df_quarterly['BAA_AAA_SPREAD_10Y'] = merged_df_quarterly['BAA_SPREAD_10Y'] - merged_df_quarterly['AAA_SPREAD_10Y']
-            log_transform_vars = ['EFFR', '10Y', '2Y']
-            for col in log_transform_vars:
-                if col in merged_df_quarterly.columns:
-                    merged_df_quarterly[col] = np.log(merged_df_quarterly[col])
-            spx = yf.Ticker('^GSPC')
-            spx_data = spx.history(period='max')['Close'].resample('QE').last()
-            spx_data.index = spx_data.index.tz_localize(None)
-            new_df = pd.DataFrame(spx_data.pct_change())
-            new_df.dropna(inplace=True)
-            new_df.columns = ['MARKET_RETURN']
-            merged_df_quarterly = pd.merge(merged_df_quarterly, new_df, left_index=True, right_index=True, how='left')
-            var_columns = [
-                'EMPLOYMENT', 'EFFR', 'FPI', 'GDP', 'GDP_DEF', '10Y', 'M2', 'PCE',
-                'UNEMPLOYMENT', 'PCE_PRICE_INDEX', '2Y', 'USD_INDEX', 'MARKET_RETURN',
-                'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF', 'BAA_AAA_SPREAD_10Y'
-            ]
-            self.processed_data = merged_df_quarterly[var_columns].dropna()
-            self.last_observed_level = self.processed_data.iloc[-1].copy()
-            self.differenced_data = self.processed_data.diff().dropna()
+
+        fred_data_sources = {
+            'AAA_SPREAD_FF': 'AAAFF',
+            'AAA_SPREAD_10Y': 'AAA10YM',
+            'BAA_SPREAD_FF': 'BAAFF',
+            'BAA_SPREAD_10Y': 'BAA10YM',
+            'EMPLOYMENT': 'CE16OV',
+            'EFFR': 'FEDFUNDS',
+            'FPI': 'FPI',
+            'GDP': 'GDP',
+            'GDP_DEF': 'GDPDEF',
+            '10Y': 'GS10',
+            'M2': 'M2SL',
+            'PCE': 'PCEC',
+            'UNEMPLOYMENT': 'UNRATE',
+            'PCE_PRICE_INDEX': 'PCEPI',
+            '2Y': 'GS2',
+        }
+        twexb = self.fred.get_series('TWEXB')
+        dtwexbgs = self.fred.get_series('DTWEXBGS')
+        overlap_start = max(twexb.index.min(), dtwexbgs.index.min())
+        scale = dtwexbgs.loc[dtwexbgs.index==overlap_start] / twexb.loc[twexb.index==overlap_start]
+        twexb_rebased = twexb * scale
+        combined_usd_index = pd.concat([
+            twexb_rebased.loc[:overlap_start - pd.Timedelta(days=1)],
+            dtwexbgs.loc[overlap_start:]
+        ])
+        all_fred_dataframes = [pd.DataFrame(combined_usd_index, columns=['USD_INDEX']).resample('QE').last()]
+        for col_name, series_id in fred_data_sources.items():
+            df = pd.DataFrame(self.fred.get_series(series_id), columns=[col_name])
+            all_fred_dataframes.append(df.resample('QE').last())
+        merged_df = pd.concat(all_fred_dataframes, axis=1, join='inner')
+        merged_df = merged_df.apply(pd.to_numeric, errors='coerce')
+        merged_df.dropna(inplace=True)
+        merged_df_quarterly = merged_df.resample('QE').last()
+        merged_df_quarterly['BAA_AAA_SPREAD_FF'] = merged_df_quarterly['BAA_SPREAD_FF'] - merged_df_quarterly['AAA_SPREAD_FF']
+        merged_df_quarterly['BAA_AAA_SPREAD_10Y'] = merged_df_quarterly['BAA_SPREAD_10Y'] - merged_df_quarterly['AAA_SPREAD_10Y']
+        log_transform_vars = ['EFFR', '10Y', '2Y']
+        for col in log_transform_vars:
+            if col in merged_df_quarterly.columns:
+                merged_df_quarterly[col] = np.log(merged_df_quarterly[col])
+        spx = yf.Ticker('^GSPC')
+        spx_data = spx.history(period='max')['Close'].resample('QE').last()
+        spx_data.index = spx_data.index.tz_localize(None)
+        new_df = pd.DataFrame(spx_data.pct_change())
+        new_df.dropna(inplace=True)
+        new_df.columns = ['MARKET_RETURN']
+        merged_df_quarterly = pd.merge(merged_df_quarterly, new_df, left_index=True, right_index=True, how='left')
+        var_columns = [
+            'EMPLOYMENT', 'EFFR', 'FPI', 'GDP', 'GDP_DEF', '10Y', 'M2', 'PCE',
+            'UNEMPLOYMENT', 'PCE_PRICE_INDEX', '2Y', 'USD_INDEX', 'MARKET_RETURN',
+            'AAA_SPREAD_FF', 'AAA_SPREAD_10Y', 'BAA_AAA_SPREAD_FF', 'BAA_AAA_SPREAD_10Y'
+        ]
+        self.processed_data = merged_df_quarterly[var_columns].dropna()
+        self.last_observed_level = self.processed_data.iloc[-1].copy()
+        self.differenced_data = self.processed_data.diff().dropna()
         if self.debug:
             print("Data ready. Shape:", self.processed_data.shape)
 

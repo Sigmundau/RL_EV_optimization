@@ -9,9 +9,10 @@ import datetime
 from collections import deque
 import numpy as np
 from collections import namedtuple
-from environments.mnm_v1b import MnM_v1b
+from environments.mnm_v1c import MnM_v1c
 import settings
 from tensordict import TensorDict
+import torch.nn.init as init
 
 # PPO Hyperparameters
 learning_rate = 1e-4
@@ -20,10 +21,11 @@ lmbda = 0.95
 eps_clip = 0.2
 K_epochs = 4
 T_horizon = 256
-mini_batch_size = 64
-max_grad_norm = 0.5  # For gradient clipping
-adam_epsilon = 1e-5  # Adam epsilon parameter
-reward_scale = 1.0  # Reward scaling factor
+mini_batch_size = 64  # For LSTM, this is the sequence length
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+reward_scale = 1.0
+lstm_hidden_size = 128
 
 # Running mean/std for state and reward normalization
 class RunningMeanStd:
@@ -51,25 +53,28 @@ class RunningMeanStd:
     def normalize(self, x):
         return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
-state_rms = None  # Will be initialized after obs_dim is known
+state_rms = None
 reward_rms = RunningMeanStd(())
 
-# Environment parameters (customize as needed)
+# Environment parameters
 ticker = 'KO'
-fred_api_key = settings.fred_api_key  # Ensure this is set in settings.py
+fred_api_key = settings.fred_api_key
 terminal_growth_rate = 0.02
 credit_rating = 'A'
 simulation_horizon = 10
 csv_path = "data/KO_quarterly.csv"
 debug = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-env = MnM_v1b(
+log_dir = os.path.join("runs", "2013_v1d_float")
+env = MnM_v1c(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
     credit_rating=credit_rating,
     fixed_origin=False,
+    simulation_earliest_origin = datetime.datetime(2007, 6, 30),
+    # fixed_origin=True,
+    # simulation_earliest_origin = datetime.datetime(2013, 6, 30),
     simulation_horizon=simulation_horizon,
     csv_path=csv_path,
     fixed_path=False,  # Training env: random path
@@ -78,7 +83,7 @@ env = MnM_v1b(
 )
 
 # Fixed-path environment for evaluation
-eval_env = MnM_v1b(
+eval_env = MnM_v1c(
     ticker=ticker,
     fred_api_key=fred_api_key,
     terminal_growth_rate=terminal_growth_rate,
@@ -87,19 +92,16 @@ eval_env = MnM_v1b(
     simulation_horizon=simulation_horizon,
     csv_path=csv_path,
     fixed_path=True,  # Evaluation env: fixed path
-    fixed_path_csv='data/simulated_path_10step.csv',
+    fixed_path_csv='data/20131231_real_path.csv',
     debug=debug,
     device=device.type
 )
 
-
-# Retrieve observation and action shapes from env.reset() and action_spec
 obs = env.reset()
 obs_financial_dim = len(obs["financial_metrics"])
 obs_macro_dim = len(obs["macro_economic_data"])
 obs_dim = obs_financial_dim + obs_macro_dim
 
-# Get action spec info directly from environment using .specs
 action_spec = env.action_spec
 if hasattr(action_spec, 'space') and hasattr(action_spec.space, 'n'):
     act_dim = action_spec.space.n
@@ -110,172 +112,111 @@ if hasattr(action_spec, 'shape') and action_spec.shape is not None:
 else:
     raise ValueError("Could not determine action shape from action_spec.shape.")
 
-
-
-# Multi-categorical actor-critic for 2D categorical action
-import torch.nn.init as init
-
 def orthogonal_init(module):
-    if isinstance(module, nn.Linear):
-        init.orthogonal_(module.weight)
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0)
+    if isinstance(module, (nn.Linear, nn.LSTM)):
+        if isinstance(module, nn.Linear):
+            init.orthogonal_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if 'bias' in name:
+                    nn.init.constant_(param, 0)
+                elif 'weight' in name:
+                    init.orthogonal_(param)
 
-class ActorCritic(nn.Module):
-    """
-    Standard multi-categorical actor-critic network for PPO.
-    The actor outputs logits for each action dimension; the critic outputs a state value.
-    """
-    def __init__(self, obs_dim, act_dim, action_shape):
+class ActorCriticLSTM(nn.Module):
+    def __init__(self, obs_dim, act_dim, action_shape, lstm_hidden_size):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.action_shape = action_shape
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.Linear(64, act_dim * action_shape)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1)
-        )
-        self.apply(orthogonal_init)
+        self.lstm_hidden_size = lstm_hidden_size
 
-    def forward(self, x):
-        logits = self.actor(x).view(-1, self.action_shape, self.act_dim)
-        value = self.critic(x)
-        return logits, value
-
-    def act(self, x):
-        logits, _ = self.forward(x)
-        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
-        actions = torch.stack([dist.sample() for dist in dists], dim=1)
-        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
-        return actions.squeeze(0), log_probs.squeeze(0)
-
-    def evaluate(self, x, actions):
-        logits, value = self.forward(x)
-        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
-        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
-        entropy = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
-        return log_probs, entropy, value
-
-class ImprovedActorCritic(nn.Module):
-    """
-    Improved multi-categorical actor-critic network with a shared feature extractor,
-    separate actor and critic heads, and dropout for regularization.
-    Uses Tanh activations and orthogonal initialization.
-    """
-    def __init__(self, obs_dim, act_dim, action_shape):
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-        self.action_shape = action_shape
-        # Shared feature extractor
-        self.shared = nn.Sequential(
+        self.shared_fc = nn.Sequential(
             nn.Linear(obs_dim, 256),
             nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 256),
-            nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.Tanh()
         )
-        # Separate actor and critic heads
-        self.actor = nn.Sequential(
-            nn.Linear(128, 128),
+        self.lstm = nn.LSTM(256, lstm_hidden_size, batch_first=False)
+        self.actor_head = nn.Sequential(
+            nn.Linear(lstm_hidden_size, 128),
             nn.Tanh(),
             nn.Linear(128, act_dim * action_shape)
         )
-        self.critic = nn.Sequential(
-            nn.Linear(128, 128),
+        self.critic_head = nn.Sequential(
+            nn.Linear(lstm_hidden_size, 128),
             nn.Tanh(),
             nn.Linear(128, 1)
         )
         self.apply(orthogonal_init)
 
-    def forward(self, x):
-        shared_features = self.shared(x)
-        logits = self.actor(shared_features).view(-1, self.action_shape, self.act_dim)
-        value = self.critic(shared_features)
-        return logits, value
+    def forward(self, x, hidden):
+        # x shape: (seq_len, batch_size, obs_dim)
+        features = self.shared_fc(x)
+        lstm_out, hidden = self.lstm(features, hidden)
+        logits = self.actor_head(lstm_out).view(lstm_out.shape[0], lstm_out.shape[1], self.action_shape, self.act_dim)
+        value = self.critic_head(lstm_out)
+        return logits, value, hidden
 
-    def act(self, x):
-        logits, _ = self.forward(x)
+    def act(self, x, hidden):
+        # x shape: (1, 1, obs_dim)
+        logits, _, hidden = self.forward(x, hidden)
+        logits = logits.squeeze(0)
         dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
         actions = torch.stack([dist.sample() for dist in dists], dim=1)
         log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
-        return actions.squeeze(0), log_probs.squeeze(0)
+        return actions.squeeze(0), log_probs.squeeze(0), hidden
 
-    def evaluate(self, x, actions):
-        logits, value = self.forward(x)
-        dists = [torch.distributions.Categorical(logits=logits[:, i, :]) for i in range(self.action_shape)]
-        log_probs = torch.stack([dist.log_prob(actions[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
+    def evaluate(self, x, actions, hidden):
+        # x shape: (seq_len, batch_size, obs_dim)
+        # actions shape: (seq_len, batch_size, action_shape)
+        logits, value, _ = self.forward(x, hidden)
+        logits_flat = logits.view(-1, self.action_shape, self.act_dim)
+        actions_flat = actions.view(-1, self.action_shape)
+        dists = [torch.distributions.Categorical(logits=logits_flat[:, i, :]) for i in range(self.action_shape)]
+        log_probs = torch.stack([dist.log_prob(actions_flat[:, i]) for i, dist in enumerate(dists)], dim=1).sum(dim=1)
         entropy = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
+        log_probs = log_probs.view(x.shape[0], x.shape[1])
+        entropy = entropy.view(x.shape[0], x.shape[1])
+        value = value.squeeze(-1)
         return log_probs, entropy, value
 
-# model = ActorCritic(obs_dim, act_dim, action_shape).to(device)
-model = ImprovedActorCritic(obs_dim, act_dim, action_shape).to(device)
+model = ActorCriticLSTM(obs_dim, act_dim, action_shape, lstm_hidden_size).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate, eps=adam_epsilon)
-
-# Learning rate scheduler for decay
 lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1 - epoch / 1000)
 
-Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'log_prob', 'done'])
+Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'log_prob', 'done', 'hidden'])
 
 def collect_trajectories(env, model, horizon):
-    """
-    Collects a batch of trajectories (state, action, reward, etc.) from the environment using the current policy.
-
-    Args:
-        env: The environment to interact with.
-        model: The policy/value network.
-        horizon: Number of steps to collect.
-
-    Returns:
-        memory: List of Transition namedtuples.
-        knockout_count: Number of knockout events in the batch.
-    """
     state = env.reset()
     memory = []
     knockout_count = 0
-    # Determine expected macro_economic_data length from initial obs
     expected_macro_dim = len(state["macro_economic_data"])
+    hidden = (torch.zeros(1, 1, model.lstm_hidden_size, device=device),
+              torch.zeros(1, 1, model.lstm_hidden_size, device=device))
     for _ in range(horizon):
-        # Convert observation dict to torch tensor on GPU, always flatten to 1D
         state_fin = torch.as_tensor(state["financial_metrics"], dtype=torch.float32, device=device).flatten()
         state_mac_raw = state["macro_economic_data"]
         state_mac = torch.as_tensor(state_mac_raw, dtype=torch.float32, device=device).flatten()
-        # Pad macro_economic_data if needed
         if state_mac.shape[0] < expected_macro_dim:
             pad_len = expected_macro_dim - state_mac.shape[0]
             state_mac = torch.cat([state_mac, torch.zeros(pad_len, dtype=state_mac.dtype, device=state_mac.device)])
         elif state_mac.shape[0] > expected_macro_dim:
             state_mac = state_mac[:expected_macro_dim]
         state_np = torch.cat([state_fin, state_mac]).cpu().numpy()
-        # State normalization (update running stats)
         global state_rms
         if state_rms is not None:
             state_rms.update([state_np])
             state_np_norm = state_rms.normalize(state_np)
         else:
             state_np_norm = state_np
-        state_tensor = torch.as_tensor(state_np_norm, dtype=torch.float32, device=device).unsqueeze(0)
-        action, log_prob = model.act(state_tensor)
+        state_tensor = torch.as_tensor(state_np_norm, dtype=torch.float32, device=device).view(1, 1, -1)
+        current_hidden = hidden
+        action, log_prob, hidden = model.act(state_tensor, hidden)
         action_np = action.detach().cpu().numpy().squeeze()
-        # Prepare action as TensorDict for TorchRL
         action_tensor = torch.as_tensor(action_np, dtype=torch.long, device=device)
         action_td = TensorDict({"action": action_tensor}, batch_size=[], device=device)
         step_td = env.step(action_td)
-
-        # --- Robust extraction of reward, done, next_state, knockout from nested 'next' dicts ---
         td = step_td
         reward = td.get('next').get('reward').item()
         done = td.get('next').get('done').item()
@@ -283,144 +224,102 @@ def collect_trajectories(env, model, horizon):
         if knockout:
             knockout_count += 1
         next_state = td.get('next').get('next')
-        memory.append(Transition(state, action_np, reward, next_state, log_prob.item(), done))
+        memory.append(Transition(state, action_np, reward, next_state, log_prob.item(), done, current_hidden))
         state = next_state
         if done:
             state = env.reset()
+            hidden = (torch.zeros(1, 1, model.lstm_hidden_size, device=device),
+                      torch.zeros(1, 1, model.lstm_hidden_size, device=device))
     return memory, knockout_count
 
 def compute_gae(rewards, values, dones, gamma=0.99, lmbda=0.95):
-    """
-    Computes Generalized Advantage Estimation (GAE) for a batch of rewards and values.
-
-    Args:
-        rewards: Tensor of rewards.
-        values: Tensor of value estimates.
-        dones: Tensor of done flags.
-        gamma: Discount factor.
-        lmbda: GAE lambda parameter.
-
-    Returns:
-        Tensor of advantage estimates.
-    """
-    """Compute GAE advantages"""
     advantages = []
     gae = 0
+    next_values = torch.cat([values[1:], torch.tensor([0.0], device=values.device)])
     for i in reversed(range(len(rewards))):
-        if i == len(rewards) - 1:
-            nextnonterminal = 1.0 - dones[i]
-            nextvalues = 0
-        else:
-            nextnonterminal = 1.0 - dones[i+1]
-            nextvalues = values[i+1]
-        delta = rewards[i] + gamma * nextvalues * nextnonterminal - values[i]
+        nextnonterminal = 1.0 - dones[i]
+        delta = rewards[i] + gamma * next_values[i] * nextnonterminal - values[i]
         gae = delta + gamma * lmbda * nextnonterminal * gae
         advantages.insert(0, gae)
     advantages = torch.tensor(advantages, dtype=torch.float32, device=values.device)
-    # Advantage normalization (Trick 1)
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     return advantages
 
 def ppo_update(memory, model, optimizer):
-    """
-    Performs a PPO update step using the collected batch of transitions.
-
-    Args:
-        memory: List of Transition namedtuples.
-        model: The policy/value network.
-        optimizer: The optimizer for updating model parameters.
-    """
-    # Convert memory to tensors (all on GPU)
-    # Determine expected macro_economic_data length from first transition
     expected_macro_dim = len(memory[0].state["macro_economic_data"]) if hasattr(memory[0].state["macro_economic_data"], '__len__') else 1
     def to_1d_np(arr):
         arr = arr.detach().cpu().numpy() if isinstance(arr, torch.Tensor) else arr
-        arr = np.atleast_1d(arr)
-        return arr
-
-    states_np = []
-    for t in memory:
-        fin = to_1d_np(t.state["financial_metrics"])
-        mac_raw = t.state["macro_economic_data"]
+        return np.atleast_1d(arr)
+    def process_state(state):
+        fin = to_1d_np(state["financial_metrics"])
+        mac_raw = state["macro_economic_data"]
         mac = to_1d_np(mac_raw)
-        # Pad macro if needed
         if mac.shape[0] < expected_macro_dim:
             mac = np.concatenate([mac, np.zeros(expected_macro_dim - mac.shape[0], dtype=mac.dtype)])
         elif mac.shape[0] > expected_macro_dim:
             mac = mac[:expected_macro_dim]
         state_vec = np.concatenate([fin, mac])
-        # State normalization (Trick 2)
         global state_rms
         if state_rms is not None:
-            state_rms.update([state_vec])
             state_vec = state_rms.normalize(state_vec)
-        states_np.append(state_vec)
-    states_np = np.array(states_np)
-    states = torch.from_numpy(states_np).float().to(device)
-    actions_np = np.array([t.action for t in memory])
-    actions = torch.from_numpy(actions_np).long().to(device)
+        return state_vec
     rewards_np = np.array([t.reward for t in memory], dtype=np.float32)
-    # Reward normalization and scaling (Trick 3 & 4)
     global reward_rms
     reward_rms.update(rewards_np)
     rewards_np = reward_rms.normalize(rewards_np) * reward_scale
-    rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device)
-    dones = torch.tensor([t.done for t in memory], dtype=torch.float32, device=device)
-    old_log_probs = torch.tensor([t.log_prob for t in memory], dtype=torch.float32, device=device)
-
-    # Compute returns and advantages
-    returns = []
-    G = 0
-    for reward, done in zip(reversed(rewards.cpu().numpy()), reversed(dones.cpu().numpy())):
-        if done:
-            G = 0
-        G = reward + gamma * G
-        returns.insert(0, G)
-    returns = torch.tensor(returns, dtype=torch.float32, device=device)
+    states_np = np.array([process_state(t.state) for t in memory])
+    states = torch.from_numpy(states_np).float().to(device)
     with torch.no_grad():
-        _, values = model(states)
-        values = values.squeeze()
+        values = []
+        start_idx = 0
+        for i in range(len(memory)):
+            if memory[i].done or i == len(memory) - 1:
+                end_idx = i + 1
+                sub_traj_states = states[start_idx:end_idx].unsqueeze(1)
+                initial_hidden = memory[start_idx].hidden
+                _, sub_traj_values, _ = model.forward(sub_traj_states, initial_hidden)
+                values.extend(sub_traj_values.squeeze().tolist())
+                start_idx = end_idx
+    values = torch.tensor(values, dtype=torch.float32, device=device)
+    dones = torch.tensor([t.done for t in memory], dtype=torch.float32, device=device)
+    rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device)
     advantages = compute_gae(rewards, values, dones, gamma, lmbda)
     returns = advantages + values
-
-    # PPO update
+    old_log_probs = torch.tensor([t.log_prob for t in memory], dtype=torch.float32, device=device)
+    actions_np = np.array([t.action for t in memory])
+    actions = torch.from_numpy(actions_np).long().to(device)
     global writer, global_step
     for _ in range(K_epochs):
         for i in range(0, len(memory), mini_batch_size):
-            idx = slice(i, i + mini_batch_size)
-            log_probs, entropy, value = model.evaluate(states[idx], actions[idx])
+            end = i + mini_batch_size
+            if end > len(memory): continue
+            idx = slice(i, end)
+            h0, c0 = memory[i].hidden
+            initial_hidden = (h0.detach(), c0.detach())
+            states_seq = states[idx].unsqueeze(1)
+            actions_seq = actions[idx].unsqueeze(1)
+            log_probs, entropy, value = model.evaluate(states_seq, actions_seq, initial_hidden)
+            log_probs, entropy, value = log_probs.squeeze(1), entropy.squeeze(1), value.squeeze(1)
             ratio = torch.exp(log_probs - old_log_probs[idx])
             surr1 = ratio * advantages[idx]
             surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages[idx]
             actor_loss = -torch.min(surr1, surr2).mean()
-            critic_loss = nn.MSELoss()(value.squeeze(), returns[idx])
+            critic_loss = nn.MSELoss()(value, returns[idx])
             loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy.mean()
             optimizer.zero_grad()
             loss.backward()
-            # Gradient clipping (Trick 7)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
-            # TensorBoard logging for losses
             if writer is not None:
                 writer.add_scalar('Loss/actor_loss', actor_loss.item(), global_step)
                 writer.add_scalar('Loss/critic_loss', critic_loss.item(), global_step)
                 writer.add_scalar('Loss/total_loss', loss.item(), global_step)
             global_step += 1
-    # Learning rate decay (Trick 6)
     lr_scheduler.step()
 
-
 def main(log_to_tensorboard=True):
-    """
-    Main training loop for PPO agent.
-    Trains on the random-path environment and periodically evaluates on the fixed-path environment.
-
-    Args:
-        log_to_tensorboard (bool): If True, logs metrics to TensorBoard.
-    """
-    # TensorBoard setup
     if log_to_tensorboard:
-        log_dir = os.path.join("runs", f"mnm_ppo_v1d_float_10step_10kepisode_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        # log_dir = os.path.join("runs", f"mnm_ppo_v1e_lstm_float_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(log_dir, exist_ok=True)
         global writer, global_step
         writer = SummaryWriter(log_dir)
@@ -430,10 +329,9 @@ def main(log_to_tensorboard=True):
     global_step = 0
     test_step = 0
     reward_window = deque(maxlen=100)
-    # --- Training loop ---
     global state_rms
     state_rms = RunningMeanStd(obs_dim)
-    for episode in range(10000):
+    for episode in range(1000):
         memory, knockout_count = collect_trajectories(env, model, T_horizon)
         episode_reward = sum(t.reward for t in memory) / len(memory)
         reward_window.append(episode_reward)
@@ -445,34 +343,18 @@ def main(log_to_tensorboard=True):
         ppo_update(memory, model, optimizer)
         if episode % 10 == 0 and len(reward_window) > 0:
             print(f"Episode {episode} completed. Episodic reward: {episode_reward:.2f} | Knockout %: {knockout_pct:.2%}")
-            # --- Evaluation on fixed-path environment ---
-            eval_fixed_path(model, eval_env, simulation_horizon, device, test_step,writer)
+            eval_fixed_path(model, eval_env, simulation_horizon, device, test_step, writer)
             test_step += 1
     if writer is not None:
         writer.close()
 
 def eval_fixed_path(model, eval_env, simulation_horizon, device, test_step, writer=None):
-    """
-    Run 1 full episode on the fixed-path environment and log results to TensorBoard if writer is provided.
-
-    Args:
-        model: The policy/value network.
-        eval_env: The fixed-path evaluation environment.
-        simulation_horizon: Number of steps to run in the episode.
-        device: Torch device.
-        test_step: Current evaluation step (for TensorBoard logging).
-        writer: TensorBoard SummaryWriter (optional).
-
-    Returns:
-        None
-    """
-    """
-    Run 1 full episode on the fixed-path environment and log results to TensorBoard if writer is provided.
-    """
     eval_rewards = []
     eval_knockout_count = 0
     state = eval_env.reset()
     expected_macro_dim = len(state["macro_economic_data"])
+    hidden = (torch.zeros(1, 1, model.lstm_hidden_size, device=device),
+              torch.zeros(1, 1, model.lstm_hidden_size, device=device))
     for step in range(simulation_horizon):
         state_fin = torch.as_tensor(state["financial_metrics"], dtype=torch.float32, device=device).flatten()
         state_mac_raw = state["macro_economic_data"]
@@ -482,8 +364,10 @@ def eval_fixed_path(model, eval_env, simulation_horizon, device, test_step, writ
             state_mac = torch.cat([state_mac, torch.zeros(pad_len, dtype=state_mac.dtype, device=state_mac.device)])
         elif state_mac.shape[0] > expected_macro_dim:
             state_mac = state_mac[:expected_macro_dim]
-        state_tensor = torch.cat([state_fin, state_mac]).unsqueeze(0)
-        action, log_prob = model.act(state_tensor)
+        state_np = torch.cat([state_fin, state_mac]).cpu().numpy()
+        state_np_norm = state_rms.normalize(state_np) if state_rms is not None else state_np
+        state_tensor = torch.as_tensor(state_np_norm, dtype=torch.float32, device=device).view(1, 1, -1)
+        action, _, hidden = model.act(state_tensor, hidden)
         action_np = action.detach().cpu().numpy().squeeze()
         action_tensor = torch.as_tensor(action_np, dtype=torch.long, device=device)
         action_td = TensorDict({"action": action_tensor}, batch_size=[], device=device)
@@ -506,8 +390,5 @@ def eval_fixed_path(model, eval_env, simulation_horizon, device, test_step, writ
         writer.flush()
     return
 
-
-
 if __name__ == "__main__":
-    # Set log_to_tensorboard=False to disable logging
     main(log_to_tensorboard=True)
